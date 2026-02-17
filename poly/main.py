@@ -1,97 +1,108 @@
 #!/usr/bin/env python3
-"""Poly — Polymarket BTC mispricing scanner.
+"""Poly — Polymarket 5-minute BTC up/down scanner.
 
-Scans active Polymarket Bitcoin up/down markets, calculates fair
-probabilities using a volatility-based model, and surfaces markets
-where the crowd has mispriced the outcome.
+Scans upcoming 5-minute Bitcoin markets on Polymarket, calculates
+fair probabilities using momentum and volatility signals, and
+surfaces markets where the crowd has mispriced the outcome.
 """
 
 import argparse
 import sys
+import time
+from datetime import datetime, timezone
 
-from poly.btc import get_price, realized_volatility
-from poly.model import evaluate_market
-from poly.polymarket import fetch_btc_markets
+from poly.btc import get_snapshot
+from poly.model import evaluate_5m_market
+from poly.polymarket import fetch_5m_markets
 
 
-def scan(edge_threshold: float = 0.03, vol_window: int = 168) -> None:
-    """Run a full scan of BTC markets and print signals."""
+def scan(edge_threshold: float = 0.03, future_windows: int = 12) -> None:
+    """Run a single scan of 5-minute BTC markets."""
+    now = datetime.now(timezone.utc)
     print("=" * 72)
-    print("  POLY — Polymarket BTC Mispricing Scanner")
+    print("  POLY — 5-Minute BTC Up/Down Scanner")
+    print(f"  {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 72)
 
-    # 1. Fetch BTC data
-    print("\n[1/3] Fetching BTC price and volatility...")
-    btc_price = get_price()
-    vol = realized_volatility(vol_window)
-    print(f"  BTC Price:  ${btc_price:,.2f}")
-    print(f"  Volatility: {vol:.1%} annualized ({vol_window}h window)")
+    # 1. BTC snapshot
+    print("\n[1/3] Fetching BTC snapshot...")
+    snap = get_snapshot()
+    print(f"  Price:        ${snap.price:,.2f}")
+    print(f"  Momentum 5m:  {snap.momentum_5m:+.4%}")
+    print(f"  Momentum 15m: {snap.momentum_15m:+.4%}")
+    print(f"  Vol (1m):     {snap.volatility_1m:.1%} ann.")
+    print(f"  Vol (1h):     {snap.volatility_1h:.1%} ann.")
 
     # 2. Discover markets
-    print("\n[2/3] Discovering Polymarket BTC markets...")
-    markets = fetch_btc_markets()
-    with_strike = [m for m in markets if m.strike is not None]
-    print(f"  Found {len(markets)} markets ({len(with_strike)} with parseable strikes)")
+    print("\n[2/3] Discovering 5-minute markets...")
+    markets = fetch_5m_markets(past_windows=2, future_windows=future_windows)
+    tradeable = [m for m in markets if m.is_tradeable]
+    print(f"  Found {len(markets)} markets ({len(tradeable)} tradeable)")
 
-    if not with_strike:
-        print("\n  No markets with strike prices found. Exiting.")
+    if not tradeable:
+        print("\n  No tradeable markets found.")
         return
 
-    # 3. Evaluate each market (skip expired / no-liquidity)
-    print(f"\n[3/3] Evaluating markets (edge threshold: {edge_threshold:.0%})...")
+    # 3. Evaluate
+    from poly.model import fair_prob_up
+    model_now = fair_prob_up(snap, minutes_ahead=0)
+    print(f"\n[3/3] Model P(Up) next window = {model_now:.1%}  (edge threshold: {edge_threshold:.0%})")
+    mom_dir = "UP" if snap.momentum_5m > 0 else "DOWN" if snap.momentum_5m < 0 else "FLAT"
+    print(f"  Momentum direction: {mom_dir}")
+    print()
+
     signals = []
-    for m in with_strike:
-        sig = evaluate_market(
-            question=m.question,
-            slug=m.slug,
-            strike=m.strike,
-            expiry=m.end_date,
-            market_yes_price=m.mid if m.mid > 0 else m.yes_price,
-            best_bid=m.best_bid,
-            best_ask=m.best_ask,
-            volume_24h=m.volume_24h,
-            liquidity=m.liquidity,
-            btc_price=btc_price,
-            volatility=vol,
-            edge_threshold=edge_threshold,
-        )
-        # Skip expired markets (0 hours left, no liquidity)
-        if sig.hours_left <= 0 and sig.liquidity == 0:
-            continue
+    for m in tradeable:
+        sig = evaluate_5m_market(m, snap, edge_threshold)
         signals.append(sig)
 
-    # Sort: actionable signals first, then by absolute edge descending
-    signals.sort(key=lambda s: (s.side == "NO EDGE", -abs(s.edge)))
+    # Sort: actionable first, then by time
+    signals.sort(key=lambda s: (s.side == "NO EDGE", s.window_start))
 
-    # Print results
     actionable = [s for s in signals if s.side != "NO EDGE"]
-    print(f"\n  {len(actionable)} actionable signals found\n")
+    print(f"  {len(actionable)} actionable / {len(signals)} total\n")
     print("-" * 72)
 
     for sig in signals:
         _print_signal(sig)
 
-    # Summary
     if actionable:
         print("=" * 72)
-        print("  SUMMARY — Top Opportunities")
+        print("  TOP OPPORTUNITIES")
         print("=" * 72)
         for sig in actionable[:5]:
-            direction = "↑ YES" if sig.side == "BUY YES" else "↓ NO"
+            arrow = "^UP " if sig.side == "BUY UP" else "vDOW"
+            t = datetime.fromtimestamp(sig.window_start, tz=timezone.utc)
             print(
-                f"  {direction}  edge={sig.edge:+.1%}  "
+                f"  {arrow}  edge={sig.edge:+.1%}  "
                 f"EV={sig.expected_value:+.1%}  "
-                f"${sig.strike:,.0f}  "
-                f"({sig.hours_left:.1f}h left)  "
-                f"vol=${sig.volume_24h:,.0f}"
+                f"in {sig.minutes_until:.0f}m  "
+                f"{t.strftime('%H:%M')}-{(t.minute+5)%60:02d} UTC  "
+                f"liq=${sig.liquidity:,.0f}"
             )
         print()
     else:
-        print("\n  No mispriced markets found. The crowd is efficient today.\n")
+        print("\n  Markets efficiently priced. No edge detected.\n")
+
+
+def watch(edge_threshold: float = 0.03, interval: int = 60) -> None:
+    """Continuously scan markets at the given interval (seconds)."""
+    print(f"Watching markets every {interval}s. Press Ctrl+C to stop.\n")
+    while True:
+        try:
+            scan(edge_threshold=edge_threshold)
+            print(f"\n  Next scan in {interval}s...\n")
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            return
 
 
 def _print_signal(sig) -> None:
     """Print a single signal."""
+    t = datetime.fromtimestamp(sig.window_start, tz=timezone.utc)
+    window_str = f"{t.strftime('%H:%M')}-{t.strftime('%H')}:{(t.minute+5)%60:02d} UTC"
+
     if sig.side != "NO EDGE":
         marker = ">>> "
         label = f"*** {sig.side} ***"
@@ -99,35 +110,56 @@ def _print_signal(sig) -> None:
         marker = "    "
         label = "no edge"
 
-    print(f"{marker}{sig.question}")
-    print(f"      Strike: ${sig.strike:,.0f}  |  BTC: ${sig.btc_price:,.2f}  |  Expiry: {sig.hours_left:.1f}h")
-    print(f"      Model: {sig.model_prob:.1%}  |  Market: {sig.market_prob:.1%}  |  Edge: {sig.edge:+.1%}")
-    print(f"      Bid/Ask: {sig.best_bid:.2f}/{sig.best_ask:.2f}  |  24h Vol: ${sig.volume_24h:,.0f}  |  Liq: ${sig.liquidity:,.0f}")
+    status = ""
+    if sig.minutes_until <= 0:
+        status = " [LIVE]"
+    elif sig.minutes_until <= 5:
+        status = f" [in {sig.minutes_until:.0f}m]"
+    else:
+        status = f" [in {sig.minutes_until:.0f}m]"
+
+    print(f"{marker}{window_str}{status}  {sig.question}")
+    print(f"      Model: {sig.model_prob_up:.1%} Up  |  Market: {sig.market_prob_up:.1%} Up  |  Edge: {sig.edge:+.1%}")
+    print(f"      Mom 5m: {sig.momentum_5m:+.3%}  |  Vol: {sig.vol_1m:.1%} ann.  |  Spread: {sig.spread:.2f}")
+    print(f"      Bid/Ask: {sig.best_bid:.2f}/{sig.best_ask:.2f}  |  Liq: ${sig.liquidity:,.0f}")
     print(f"      Signal: {label}  |  EV: {sig.expected_value:+.1%}")
-    print(f"      https://polymarket.com/event/{sig.slug}")
     print("-" * 72)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan Polymarket BTC markets for mispriced binary outcomes."
+        description="Scan Polymarket 5-minute BTC up/down markets for mispricing."
     )
     parser.add_argument(
         "-e", "--edge",
         type=float,
         default=0.03,
-        help="Minimum edge threshold to flag a signal (default: 0.03 = 3%%)",
+        help="Minimum edge to flag a signal (default: 0.03 = 3%%)",
     )
     parser.add_argument(
-        "-w", "--vol-window",
+        "-n", "--windows",
         type=int,
-        default=168,
-        help="Hours of data for volatility calculation (default: 168 = 7 days)",
+        default=12,
+        help="Number of future 5-min windows to scan (default: 12 = 1 hour)",
+    )
+    parser.add_argument(
+        "-w", "--watch",
+        action="store_true",
+        help="Continuously scan (re-scan every 60s)",
+    )
+    parser.add_argument(
+        "-i", "--interval",
+        type=int,
+        default=60,
+        help="Scan interval in seconds for watch mode (default: 60)",
     )
     args = parser.parse_args()
 
     try:
-        scan(edge_threshold=args.edge, vol_window=args.vol_window)
+        if args.watch:
+            watch(edge_threshold=args.edge, interval=args.interval)
+        else:
+            scan(edge_threshold=args.edge, future_windows=args.windows)
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(1)

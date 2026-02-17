@@ -1,95 +1,72 @@
-"""Polymarket API client for discovering Bitcoin up/down markets.
+"""Polymarket API client for 5-minute Bitcoin up/down markets.
 
-Discovery strategy: The Gamma API search/filter params are unreliable,
-so we generate known slug patterns for BTC markets and probe each one
-directly. This is fast (parallel-friendly) and reliable.
+Market format:
+  Slug:     btc-updown-5m-{unix_timestamp}
+  Outcomes: ["Up", "Down"]
+  Rule:     "Up" if end_price >= start_price (Chainlink BTC/USD)
+  Windows:  Every 300 seconds, 24/7
+
+Discovery: Generate timestamps for current and upcoming 5-minute
+windows, probe each slug directly via the Gamma API.
 """
 
 import json
-import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import requests
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
-# Strike prices Polymarket typically offers for BTC markets
-BTC_STRIKES_K = [
-    40, 45, 50, 55, 58, 60, 62, 64, 65, 66, 67, 68, 69, 70,
-    72, 74, 75, 76, 78, 80, 82, 85, 88, 90, 92, 95, 98,
-    100, 105, 110, 115, 120, 125, 130, 140, 150, 175, 200,
-]
-
-# Hourly up/down market times
-UP_DOWN_TIMES = ["2pm-et"]
+WINDOW_SECONDS = 300  # 5 minutes
 
 
 @dataclass
-class Market:
-    """A single Polymarket binary outcome market."""
+class FiveMinMarket:
+    """A single 5-minute BTC up/down market."""
 
     condition_id: str
     question: str
     slug: str
-    end_date: datetime
-    yes_price: float
-    no_price: float
-    yes_token_id: str
-    no_token_id: str
-    strike: float | None
-    volume_24h: float
-    liquidity: float
+    window_start: int  # unix timestamp
+    window_end: int
+    up_price: float  # market price of "Up" token
+    down_price: float  # market price of "Down" token
+    up_token_id: str
+    down_token_id: str
     best_bid: float
     best_ask: float
+    spread: float
+    volume: float
+    liquidity: float
+    active: bool
+    closed: bool
 
     @property
-    def implied_prob_yes(self) -> float:
-        return self.yes_price
+    def seconds_until_start(self) -> float:
+        return max(self.window_start - time.time(), 0)
+
+    @property
+    def minutes_until_start(self) -> float:
+        return self.seconds_until_start / 60
+
+    @property
+    def is_tradeable(self) -> bool:
+        return self.active and not self.closed and self.liquidity > 0
 
     @property
     def mid(self) -> float:
         if self.best_bid and self.best_ask:
             return (self.best_bid + self.best_ask) / 2
-        return self.yes_price
+        return self.up_price
 
 
-def _parse_strike(question: str) -> float | None:
-    """Extract the dollar strike price from a market question."""
-    m = re.search(r"\$([0-9]{1,3}(?:,[0-9]{3})*)", question)
-    if m:
-        return float(m.group(1).replace(",", ""))
-    m = re.search(r"(\d+)k", question, re.IGNORECASE)
-    if m:
-        return float(m.group(1)) * 1000
-    return None
-
-
-def _generate_slugs(days_ahead: int = 3) -> list[str]:
-    """Generate candidate slugs for BTC markets over the next few days."""
-    slugs = []
-    now = datetime.now(timezone.utc)
-
-    for day_offset in range(days_ahead + 1):
-        date = now + timedelta(days=day_offset)
-        month = date.strftime("%B").lower()
-        day = date.day
-
-        # Strike-based: "bitcoin-above-{N}k-on-{month}-{day}"
-        for strike_k in BTC_STRIKES_K:
-            slugs.append(f"bitcoin-above-{strike_k}k-on-{month}-{day}")
-
-        # Up/down directional: "bitcoin-up-or-down-{month}-{day}-{time}"
-        for time_str in UP_DOWN_TIMES:
-            slugs.append(f"bitcoin-up-or-down-{month}-{day}-{time_str}")
-
-    return slugs
-
-
-def _fetch_market_by_slug(slug: str) -> Market | None:
-    """Fetch a single market by exact slug. Returns None if not found."""
+def _fetch_5m_market(timestamp: int) -> FiveMinMarket | None:
+    """Fetch a single 5-minute market by its window start timestamp."""
+    slug = f"btc-updown-5m-{timestamp}"
     try:
         resp = requests.get(
             f"{GAMMA_BASE}/markets",
@@ -107,49 +84,57 @@ def _fetch_market_by_slug(slug: str) -> Market | None:
         if len(outcome_prices) < 2 or len(clob_token_ids) < 2:
             return None
 
-        end_str = m.get("endDate", "")
-        end_date = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-
-        return Market(
+        return FiveMinMarket(
             condition_id=m.get("conditionId", ""),
             question=m.get("question", ""),
-            slug=m.get("slug", ""),
-            end_date=end_date,
-            yes_price=float(outcome_prices[0]),
-            no_price=float(outcome_prices[1]),
-            yes_token_id=clob_token_ids[0],
-            no_token_id=clob_token_ids[1],
-            strike=_parse_strike(m.get("question", "")),
-            volume_24h=float(m.get("volume24hr", 0) or 0),
-            liquidity=float(m.get("liquidityNum", 0) or m.get("liquidity", 0) or 0),
+            slug=slug,
+            window_start=timestamp,
+            window_end=timestamp + WINDOW_SECONDS,
+            up_price=float(outcome_prices[0]),
+            down_price=float(outcome_prices[1]),
+            up_token_id=clob_token_ids[0],
+            down_token_id=clob_token_ids[1],
             best_bid=float(m.get("bestBid", 0) or 0),
             best_ask=float(m.get("bestAsk", 0) or 0),
+            spread=float(m.get("spread", 0) or 0),
+            volume=float(m.get("volume24hr", 0) or 0),
+            liquidity=float(m.get("liquidityNum", 0) or m.get("liquidity", 0) or 0),
+            active=bool(m.get("active")),
+            closed=bool(m.get("closed")),
         )
     except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError):
         return None
 
 
-def fetch_btc_markets(days_ahead: int = 3, workers: int = 20) -> list[Market]:
-    """Discover active Bitcoin price markets by probing known slug patterns.
+def fetch_5m_markets(
+    past_windows: int = 3,
+    future_windows: int = 12,
+    workers: int = 20,
+) -> list[FiveMinMarket]:
+    """Discover 5-minute BTC up/down markets around the current time.
 
-    Generates candidate slugs for BTC strike and up/down markets over the
-    next few days, then fetches each one in parallel. Only returns active,
-    non-closed markets with valid pricing data.
+    Args:
+        past_windows: Number of past 5-min windows to check.
+        future_windows: Number of upcoming 5-min windows to check.
+        workers: Thread pool size for parallel fetches.
     """
-    slugs = _generate_slugs(days_ahead)
-    markets = []
-    seen = set()
+    now = int(time.time())
+    current_window = (now // WINDOW_SECONDS) * WINDOW_SECONDS
 
+    timestamps = [
+        current_window + (i * WINDOW_SECONDS)
+        for i in range(-past_windows, future_windows + 1)
+    ]
+
+    markets = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_fetch_market_by_slug, slug): slug for slug in slugs}
+        futures = {pool.submit(_fetch_5m_market, ts): ts for ts in timestamps}
         for future in as_completed(futures):
             market = future.result()
-            if market and market.condition_id not in seen:
-                seen.add(market.condition_id)
+            if market:
                 markets.append(market)
 
-    # Sort by strike price for consistent output
-    markets.sort(key=lambda m: m.strike or 0)
+    markets.sort(key=lambda m: m.window_start)
     return markets
 
 

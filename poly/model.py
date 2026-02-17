@@ -1,137 +1,146 @@
-"""Fair-value pricing model for Bitcoin binary outcome markets.
+"""Fair-value model for 5-minute Bitcoin up/down markets.
 
-Uses a log-normal model (equivalent to digital/binary option pricing)
-to calculate the probability that BTC will be above a strike price K
-at expiry time T, given current price S and annualized volatility σ.
+For a 5-minute window, the question is simply: will BTC go up or stay
+flat (>= start price) vs. go down (< start price)?
 
-    P(S_T > K) = Φ(d₂)
+Model components:
+  1. Base rate: ~50.0% for Up (>= rule gives tiny edge to Up, but
+     effectively 50/50 at BTC's tick size)
+  2. Momentum signal: short-term autocorrelation in 1-minute returns.
+     If BTC has been trending over the last 5-15 minutes, there's a
+     measurable continuation probability.
+  3. Momentum decay: the signal only predicts the *next* 5-min window.
+     For windows further in the future, momentum fades back to 50/50
+     with a half-life of ~10 minutes.
 
-    where d₂ = [ln(S/K) - (σ²/2)·τ] / (σ·√τ)
-
-For short-duration markets (hours to days), drift is negligible so we
-set μ = 0. The edge is the difference between our model probability
-and the market's implied probability.
+The edge is: model_prob - market_prob. When the market deviates from
+our fair value, that's the opportunity.
 """
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from scipy.stats import norm
+
+from poly.btc import BTCSnapshot
+
+
+# How much weight to give the raw momentum signal
+MOMENTUM_WEIGHT = 0.4
+
+# Half-life for momentum decay (minutes). Momentum signal halves every
+# this many minutes into the future. At 10 min, a window 10 min away
+# gets 50% of the signal; at 20 min, 25%; at 30 min, 12.5%.
+MOMENTUM_HALFLIFE_MIN = 10.0
+
+# Minimum edge to flag as actionable (must overcome spread + fees)
+DEFAULT_EDGE_THRESHOLD = 0.03
 
 
 @dataclass
 class Signal:
-    """A trading signal for a Polymarket BTC market."""
+    """A trading signal for a 5-minute BTC market."""
 
     question: str
     slug: str
-    strike: float
-    expiry: datetime
-    hours_left: float
+    window_start: int
+    minutes_until: float
     btc_price: float
-    volatility: float  # annualized
-    model_prob: float  # our fair probability of YES
-    market_prob: float  # Polymarket's implied probability of YES
-    edge: float  # model_prob - market_prob
-    side: str  # "BUY YES", "BUY NO", or "NO EDGE"
-    expected_value: float  # expected profit per $1 risked
+    momentum_5m: float
+    momentum_15m: float
+    vol_1m: float
+    model_prob_up: float
+    market_prob_up: float
+    edge: float  # model - market (positive = Up underpriced)
+    side: str  # "BUY UP", "BUY DOWN", or "NO EDGE"
+    expected_value: float
     best_bid: float
     best_ask: float
-    volume_24h: float
+    spread: float
     liquidity: float
+    tradeable: bool
 
 
-def fair_probability(spot: float, strike: float, vol: float, tau: float) -> float:
-    """Calculate the fair probability that BTC > strike at expiry.
+def fair_prob_up(snapshot: BTCSnapshot, minutes_ahead: float = 0.0) -> float:
+    """Calculate fair probability of BTC going up in a 5-minute window.
 
     Args:
-        spot: Current BTC price.
-        strike: Strike price for the market.
-        vol: Annualized volatility (e.g. 0.65 for 65%).
-        tau: Time to expiry in years.
-
-    Returns:
-        Probability between 0 and 1.
+        snapshot: Current BTC price/momentum/vol data.
+        minutes_ahead: How many minutes until this window starts.
+            0 = current window (full momentum signal).
+            Higher values decay the momentum toward 50/50.
     """
-    if tau <= 0:
-        # Already expired: deterministic
-        return 1.0 if spot > strike else 0.0
+    vol_annual = snapshot.volatility_1m
+    if vol_annual <= 0:
+        vol_annual = snapshot.volatility_1h
+    if vol_annual <= 0:
+        return 0.50
 
-    if vol <= 0:
-        return 1.0 if spot > strike else 0.0
+    # 5-minute volatility
+    tau = 5.0 / 525_960  # 5 minutes as fraction of year
+    sigma_5m = vol_annual * math.sqrt(tau)
+    if sigma_5m <= 0:
+        return 0.50
 
-    d2 = (math.log(spot / strike) - 0.5 * vol**2 * tau) / (vol * math.sqrt(tau))
-    return float(norm.cdf(d2))
+    # Raw momentum signal (weighted combo of 5m and 15m)
+    raw_mom = (
+        MOMENTUM_WEIGHT * snapshot.momentum_5m
+        + (MOMENTUM_WEIGHT * 0.5) * snapshot.momentum_15m
+    )
+
+    # Decay: momentum predicts the next window, not ones far in the future.
+    # Exponential decay with configurable half-life.
+    decay = 0.5 ** (minutes_ahead / MOMENTUM_HALFLIFE_MIN)
+    mom_signal = raw_mom * decay
+
+    # P(Up) = Φ(momentum_mean / sigma_5m)
+    prob = float(norm.cdf(mom_signal / sigma_5m))
+
+    # Clamp to reasonable range
+    return max(0.30, min(0.70, prob))
 
 
-def time_to_expiry_years(expiry: datetime) -> float:
-    """Calculate time to expiry in years from now."""
-    now = datetime.now(timezone.utc)
-    delta = expiry - now
-    seconds = max(delta.total_seconds(), 0)
-    return seconds / (365.25 * 24 * 3600)
-
-
-def evaluate_market(
-    question: str,
-    slug: str,
-    strike: float,
-    expiry: datetime,
-    market_yes_price: float,
-    best_bid: float,
-    best_ask: float,
-    volume_24h: float,
-    liquidity: float,
-    btc_price: float,
-    volatility: float,
-    edge_threshold: float = 0.03,
+def evaluate_5m_market(
+    market,  # FiveMinMarket
+    snapshot: BTCSnapshot,
+    edge_threshold: float = DEFAULT_EDGE_THRESHOLD,
 ) -> Signal:
-    """Evaluate a single market and produce a trading signal.
+    """Evaluate a single 5-minute market and produce a signal."""
+    minutes_ahead = market.minutes_until_start
+    model_up = fair_prob_up(snapshot, minutes_ahead)
+    market_up = market.mid if market.mid > 0 else market.up_price
 
-    Args:
-        edge_threshold: Minimum edge (as probability) to generate a signal.
-                        Default 3% — accounts for spread, fees, and noise.
-    """
-    tau = time_to_expiry_years(expiry)
-    hours_left = tau * 365.25 * 24
+    edge = model_up - market_up
 
-    model_prob = fair_probability(btc_price, strike, volatility, tau)
-
-    # Market's implied probability from the YES token price
-    market_prob = market_yes_price
-    edge = model_prob - market_prob
-
-    # Determine side
     if edge > edge_threshold:
-        side = "BUY YES"
-        # Buying YES at market_prob, expected value = model_prob / market_prob - 1
-        ev = (model_prob / market_prob - 1) if market_prob > 0 else 0
+        side = "BUY UP"
+        ev = (model_up / market_up - 1) if market_up > 0 else 0
     elif edge < -edge_threshold:
-        side = "BUY NO"
-        # Buying NO at (1 - market_prob), expected value
-        no_model = 1 - model_prob
-        no_market = 1 - market_prob
-        ev = (no_model / no_market - 1) if no_market > 0 else 0
+        side = "BUY DOWN"
+        model_down = 1 - model_up
+        market_down = 1 - market_up
+        ev = (model_down / market_down - 1) if market_down > 0 else 0
     else:
         side = "NO EDGE"
         ev = 0.0
 
     return Signal(
-        question=question,
-        slug=slug,
-        strike=strike,
-        expiry=expiry,
-        hours_left=hours_left,
-        btc_price=btc_price,
-        volatility=volatility,
-        model_prob=model_prob,
-        market_prob=market_prob,
+        question=market.question,
+        slug=market.slug,
+        window_start=market.window_start,
+        minutes_until=minutes_ahead,
+        btc_price=snapshot.price,
+        momentum_5m=snapshot.momentum_5m,
+        momentum_15m=snapshot.momentum_15m,
+        vol_1m=snapshot.volatility_1m,
+        model_prob_up=model_up,
+        market_prob_up=market_up,
         edge=edge,
         side=side,
         expected_value=ev,
-        best_bid=best_bid,
-        best_ask=best_ask,
-        volume_24h=volume_24h,
-        liquidity=liquidity,
+        best_bid=market.best_bid,
+        best_ask=market.best_ask,
+        spread=market.spread,
+        liquidity=market.liquidity,
+        tradeable=market.is_tradeable,
     )
