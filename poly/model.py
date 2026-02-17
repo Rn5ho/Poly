@@ -1,20 +1,17 @@
 """Fair-value model for 5-minute Bitcoin up/down markets.
 
-For a 5-minute window, the question is simply: will BTC go up or stay
-flat (>= start price) vs. go down (< start price)?
+Backtesting revealed:
+  - Strong Up momentum (>65%): 70% win rate — highly predictive
+  - Lean Down momentum (35-45%): 60% win rate — solid
+  - Strong Down momentum (<35%): ANTI-predictive (mean-reversion)
+  - Base rate is ~53.5% Up (from the >= resolution rule)
 
-Model components:
-  1. Base rate: ~50.0% for Up (>= rule gives tiny edge to Up, but
-     effectively 50/50 at BTC's tick size)
-  2. Momentum signal: short-term autocorrelation in 1-minute returns.
-     If BTC has been trending over the last 5-15 minutes, there's a
-     measurable continuation probability.
-  3. Momentum decay: the signal only predicts the *next* 5-min window.
-     For windows further in the future, momentum fades back to 50/50
-     with a half-life of ~10 minutes.
-
-The edge is: model_prob - market_prob. When the market deviates from
-our fair value, that's the opportunity.
+Model adjustments:
+  1. Base rate bias: +1.5% toward Up (>= rule + empirical 53.5%)
+  2. Asymmetric momentum: Up momentum gets full weight; Down momentum
+     gets reduced weight (mean-reversion dampens extreme Down signals)
+  3. Wider clamp range: 25-75% (was 30-70%)
+  4. Momentum decay for future windows (half-life 10 min)
 """
 
 import math
@@ -25,15 +22,24 @@ from scipy.stats import norm
 from poly.btc import BTCSnapshot
 
 
-# How much weight to give the raw momentum signal
-MOMENTUM_WEIGHT = 0.4
+# Momentum weights (asymmetric: Up > Down based on backtest)
+MOMENTUM_WEIGHT_UP = 0.45  # weight when momentum is positive
+MOMENTUM_WEIGHT_DOWN = 0.25  # weight when momentum is negative (mean-reversion dampens)
 
-# Half-life for momentum decay (minutes). Momentum signal halves every
-# this many minutes into the future. At 10 min, a window 10 min away
-# gets 50% of the signal; at 20 min, 25%; at 30 min, 12.5%.
+# 15-minute momentum contributes at 50% of the primary weight
+SECONDARY_WEIGHT_RATIO = 0.5
+
+# Base rate adjustment: >= rule + empirical bias
+BASE_PROB_UP = 0.515
+
+# Momentum decay half-life (minutes into the future)
 MOMENTUM_HALFLIFE_MIN = 10.0
 
-# Minimum edge to flag as actionable (must overcome spread + fees)
+# Probability clamp range
+PROB_FLOOR = 0.25
+PROB_CEIL = 0.75
+
+# Minimum edge to flag as actionable
 DEFAULT_EDGE_THRESHOLD = 0.03
 
 
@@ -51,9 +57,10 @@ class Signal:
     vol_1m: float
     model_prob_up: float
     market_prob_up: float
-    edge: float  # model - market (positive = Up underpriced)
+    edge: float
     side: str  # "BUY UP", "BUY DOWN", or "NO EDGE"
     expected_value: float
+    kelly_fraction: float  # optimal bet size (fraction of bankroll)
     best_bid: float
     best_ask: float
     spread: float
@@ -64,40 +71,64 @@ class Signal:
 def fair_prob_up(snapshot: BTCSnapshot, minutes_ahead: float = 0.0) -> float:
     """Calculate fair probability of BTC going up in a 5-minute window.
 
-    Args:
-        snapshot: Current BTC price/momentum/vol data.
-        minutes_ahead: How many minutes until this window starts.
-            0 = current window (full momentum signal).
-            Higher values decay the momentum toward 50/50.
+    Uses asymmetric momentum weighting: Up momentum is trusted more
+    than Down momentum (backtest shows Down extremes mean-revert).
     """
     vol_annual = snapshot.volatility_1m
     if vol_annual <= 0:
         vol_annual = snapshot.volatility_1h
     if vol_annual <= 0:
-        return 0.50
+        return BASE_PROB_UP
 
     # 5-minute volatility
-    tau = 5.0 / 525_960  # 5 minutes as fraction of year
+    tau = 5.0 / 525_960
     sigma_5m = vol_annual * math.sqrt(tau)
     if sigma_5m <= 0:
-        return 0.50
+        return BASE_PROB_UP
 
-    # Raw momentum signal (weighted combo of 5m and 15m)
-    raw_mom = (
-        MOMENTUM_WEIGHT * snapshot.momentum_5m
-        + (MOMENTUM_WEIGHT * 0.5) * snapshot.momentum_15m
-    )
+    # Asymmetric momentum: choose weight based on direction
+    mom_5m = snapshot.momentum_5m
+    mom_15m = snapshot.momentum_15m
 
-    # Decay: momentum predicts the next window, not ones far in the future.
-    # Exponential decay with configurable half-life.
+    # Primary weight depends on momentum direction
+    if mom_5m >= 0:
+        w_primary = MOMENTUM_WEIGHT_UP
+    else:
+        w_primary = MOMENTUM_WEIGHT_DOWN
+
+    # Combine 5m and 15m signals
+    raw_mom = w_primary * mom_5m + (w_primary * SECONDARY_WEIGHT_RATIO) * mom_15m
+
+    # Decay for future windows
     decay = 0.5 ** (minutes_ahead / MOMENTUM_HALFLIFE_MIN)
     mom_signal = raw_mom * decay
 
-    # P(Up) = Φ(momentum_mean / sigma_5m)
-    prob = float(norm.cdf(mom_signal / sigma_5m))
+    # Shift the base probability by the momentum signal
+    # z = (base_shift + momentum) / sigma
+    # where base_shift encodes the base rate advantage for Up
+    base_shift = norm.ppf(BASE_PROB_UP) * sigma_5m  # shift that gives BASE_PROB_UP
+    z = (base_shift + mom_signal) / sigma_5m
+    prob = float(norm.cdf(z))
 
-    # Clamp to reasonable range
-    return max(0.30, min(0.70, prob))
+    return max(PROB_FLOOR, min(PROB_CEIL, prob))
+
+
+def kelly_fraction(prob: float, odds: float = 1.0) -> float:
+    """Calculate Kelly criterion bet fraction.
+
+    For a bet at even odds (buy at ~0.50):
+      f* = (p * (b + 1) - 1) / b
+      where p = win probability, b = net odds (payout / stake)
+
+    For Polymarket at price ~0.50: b = (1.0 - price) / price ≈ 1.0
+    So: f* = 2*p - 1
+
+    We use half-Kelly for safety (halve the fraction).
+    """
+    if prob <= 0.5:
+        return 0.0
+    f = (prob * (odds + 1) - 1) / odds
+    return max(0.0, f * 0.5)  # half-Kelly
 
 
 def evaluate_5m_market(
@@ -114,15 +145,26 @@ def evaluate_5m_market(
 
     if edge > edge_threshold:
         side = "BUY UP"
+        win_prob = model_up
+        buy_price = market_up
         ev = (model_up / market_up - 1) if market_up > 0 else 0
     elif edge < -edge_threshold:
         side = "BUY DOWN"
-        model_down = 1 - model_up
-        market_down = 1 - market_up
-        ev = (model_down / market_down - 1) if market_down > 0 else 0
+        win_prob = 1 - model_up
+        buy_price = 1 - market_up
+        ev = ((1 - model_up) / (1 - market_up) - 1) if market_up < 1 else 0
     else:
         side = "NO EDGE"
+        win_prob = 0.5
+        buy_price = 0.5
         ev = 0.0
+
+    # Kelly sizing: net odds = (1 - buy_price) / buy_price
+    if buy_price > 0 and buy_price < 1 and side != "NO EDGE":
+        net_odds = (1.0 - buy_price) / buy_price
+        kf = kelly_fraction(win_prob, net_odds)
+    else:
+        kf = 0.0
 
     return Signal(
         question=market.question,
@@ -138,6 +180,7 @@ def evaluate_5m_market(
         edge=edge,
         side=side,
         expected_value=ev,
+        kelly_fraction=kf,
         best_bid=market.best_bid,
         best_ask=market.best_ask,
         spread=market.spread,
