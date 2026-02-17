@@ -153,6 +153,72 @@ def fetch_5m_markets(
     return markets
 
 
+def _fetch_resolved_outcome(timestamp: int) -> str | None:
+    """Fetch the resolved outcome for a 5-minute window.
+
+    Returns "Up", "Down", or None if not resolved.
+    """
+    slug = f"btc-updown-5m-{timestamp}"
+    try:
+        resp = requests.get(
+            f"{GAMMA_BASE}/markets",
+            params={"slug": slug},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if not results:
+            return None
+
+        m = results[0]
+        if not m.get("closed"):
+            return None
+
+        outcome_prices = json.loads(m.get("outcomePrices", "[]"))
+        if len(outcome_prices) < 2:
+            return None
+
+        if outcome_prices[0] == "1":
+            return "Up"
+        elif outcome_prices[1] == "1":
+            return "Down"
+        return None
+    except Exception:
+        return None
+
+
+def fetch_recent_outcomes(n: int = 3) -> list[str]:
+    """Fetch resolved outcomes for the last N completed 5-minute windows.
+
+    Returns list of outcomes ["Up", "Down", ...] in chronological order
+    (oldest first). Used for the conditional mean-reversion model.
+    """
+    now = int(time.time())
+    current_window = (now // WINDOW_SECONDS) * WINDOW_SECONDS
+
+    # Check last n+2 windows (some may not be resolved yet), skip current
+    timestamps = [
+        current_window - (i * WINDOW_SECONDS)
+        for i in range(1, n + 3)
+    ]
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(len(timestamps), 10)) as pool:
+        futures = {pool.submit(_fetch_resolved_outcome, ts): ts for ts in timestamps}
+        for future in as_completed(futures):
+            ts = futures[future]
+            result = future.result()
+            if result:
+                results[ts] = result
+
+    # Sort chronologically and take the last n
+    outcomes = []
+    for ts in sorted(results.keys()):
+        outcomes.append(results[ts])
+
+    return outcomes[-n:] if len(outcomes) > n else outcomes
+
+
 def fetch_order_book(token_id: str) -> dict:
     """Fetch the CLOB order book for a given token."""
     resp = requests.get(

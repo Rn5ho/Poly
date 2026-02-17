@@ -1,25 +1,14 @@
-"""Backtesting engine for the 5-minute BTC up/down model.
+"""Backtesting engine for the 5-minute BTC up/down conditional model.
 
-Reconstructs what the model would have predicted for recently resolved
-markets, compares to actual outcomes, and calculates P&L metrics.
-
-The key challenge: we need to reconstruct the BTC momentum/volatility
-snapshot as it would have looked at each historical window's start time,
-not as it looks now. We do this using Kraken 1-minute candles.
+Uses the outcome mean-reversion strategy: P(Up) depends on previous
+window outcomes, not momentum. Validates against resolved markets.
 """
 
-import json
-import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
-import requests
-
-from poly.btc import BTCSnapshot, _log_returns, _realized_vol
-
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-KRAKEN_BASE = "https://api.kraken.com/0/public"
+from poly.polymarket import _fetch_resolved_outcome
 
 WINDOW_SECONDS = 300
 
@@ -32,7 +21,7 @@ class BacktestTrade:
     window_label: str
     actual_outcome: str  # "Up" or "Down"
     model_prob_up: float
-    model_side: str  # "BUY UP", "BUY DOWN", or "NO EDGE"
+    model_side: str  # "BUY UP" or "NO EDGE"
     market_prob_up: float  # what market was pricing (always ~0.50)
     edge: float
     pnl: float  # dollar P&L for this trade
@@ -66,126 +55,6 @@ class BacktestResult:
     bankroll_history: list[float] = field(default_factory=list)
 
 
-def _fetch_resolved_outcome(timestamp: int) -> str | None:
-    """Fetch the resolved outcome for a 5-minute window.
-
-    Returns "Up", "Down", or None if not resolved.
-    """
-    slug = f"btc-updown-5m-{timestamp}"
-    try:
-        resp = requests.get(
-            f"{GAMMA_BASE}/markets",
-            params={"slug": slug},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        results = resp.json()
-        if not results:
-            return None
-
-        m = results[0]
-        if not m.get("closed"):
-            return None
-
-        outcome_prices = json.loads(m.get("outcomePrices", "[]"))
-        if len(outcome_prices) < 2:
-            return None
-
-        # ["1","0"] = Up won, ["0","1"] = Down won
-        if outcome_prices[0] == "1":
-            return "Up"
-        elif outcome_prices[1] == "1":
-            return "Down"
-        return None
-    except Exception:
-        return None
-
-
-def _fetch_candles(hours: int = 12) -> tuple[list[list], int]:
-    """Fetch OHLC candles from Kraken for backtest reconstruction.
-
-    Kraken returns max 720 candles per request, so:
-      - hours <= 11: use 1-minute candles (best granularity)
-      - hours <= 58: use 5-minute candles (good for our 5-min windows)
-      - hours > 58:  use 15-minute candles (coarser, up to ~7 days)
-
-    Returns (candles, interval_minutes) where candles are sorted by time.
-    """
-    if hours <= 11:
-        interval = 1
-    elif hours <= 58:
-        interval = 5
-    else:
-        interval = 15
-
-    since = int(time.time()) - (hours + 1) * 3600  # +1h buffer
-    resp = requests.get(
-        f"{KRAKEN_BASE}/OHLC",
-        params={"pair": "XBTUSD", "interval": interval, "since": since},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("error") and data["error"]:
-        raise RuntimeError(f"Kraken API error: {data['error']}")
-
-    candles = data["result"]["XXBTZUSD"]
-    return candles, interval
-
-
-def _reconstruct_snapshot(
-    candles: list[list], at_index: int, interval_min: int = 1
-) -> BTCSnapshot | None:
-    """Reconstruct a BTCSnapshot using candles up to the given index.
-
-    Uses candles[0..at_index] to compute momentum and volatility
-    as they would have looked at that point in time.
-
-    interval_min: candle interval in minutes (1, 5, or 15).
-    Momentum lookbacks are adjusted to cover the same real-time spans:
-      - 5-min momentum: 5/interval candles back
-      - 15-min momentum: 15/interval candles back
-    """
-    min_candles = max(5, 20 // interval_min)
-    if at_index < min_candles:
-        return None
-
-    closes = [float(c[4]) for c in candles[: at_index + 1]]
-    price = closes[-1]
-
-    # How many candles cover 5 minutes and 15 minutes?
-    candles_5m = max(1, 5 // interval_min)
-    candles_15m = max(1, 15 // interval_min)
-
-    # 5-minute momentum
-    momentum_5m = 0.0
-    if len(closes) > candles_5m:
-        momentum_5m = math.log(closes[-1] / closes[-(candles_5m + 1)])
-
-    # 15-minute momentum
-    momentum_15m = 0.0
-    if len(closes) > candles_15m:
-        momentum_15m = math.log(closes[-1] / closes[-(candles_15m + 1)])
-
-    # Realized vol from available candles
-    # Scale annualization factor by interval size
-    periods_per_year = 525_960 / interval_min
-    lookback = min(60, len(closes))
-    recent = closes[-lookback:]
-    log_rets = _log_returns(recent)
-    vol = _realized_vol(log_rets, periods_per_year)
-
-    return BTCSnapshot(
-        price=price,
-        chainlink_price=None,  # not available for historical reconstruction
-        momentum_5m=momentum_5m,
-        momentum_15m=momentum_15m,
-        volatility_1m=vol,
-        volatility_1h=vol,
-        recent_closes=recent,
-    )
-
-
 def run_backtest(
     hours: int = 6,
     edge_threshold: float = 0.03,
@@ -202,21 +71,13 @@ def run_backtest(
     4. Size bet via Kelly criterion on current bankroll
     5. Track bankroll evolution
     """
-    from poly.model import fair_prob_up, kelly_fraction as calc_kelly
+    from poly.model import conditional_prob_up, kelly_fraction as calc_kelly
 
     starting_bankroll = bankroll
     current_bankroll = bankroll
     peak_bankroll = bankroll
     max_drawdown = 0.0
     bankroll_history = [bankroll]
-
-    print(f"  Fetching {hours}h of candle data...")
-    candles, interval_min = _fetch_candles(hours)
-    coverage_h = len(candles) * interval_min / 60
-    print(f"  Got {len(candles)} candles ({interval_min}-min interval, {coverage_h:.1f}h coverage)")
-
-    # Build a time→index map for candles
-    candle_times = {int(c[0]): i for i, c in enumerate(candles)}
 
     # Generate timestamps for all 5-min windows in the backtest period
     now = int(time.time())
@@ -251,38 +112,29 @@ def run_backtest(
 
     print(f"  Got {len(outcomes)} resolved outcomes")
 
-    # For each resolved window, reconstruct snapshot and evaluate
+    # Build ordered sequence of resolved outcomes for conditional model
+    sorted_ts = sorted(outcomes.keys())
+    recent_outcomes: list[str] = []  # rolling window of recent outcomes
+
     trades = []
-    for ts in sorted(outcomes.keys()):
-        # Find the most recent candle that CLOSED BEFORE this window starts.
-        # A candle starting at candle_time closes at candle_time + interval*60.
-        # We can only use candles whose close is available at decision time (ts).
-        best_idx = None
-        best_diff = float("inf")
-        for candle_time, idx in candle_times.items():
-            candle_close_time = candle_time + interval_min * 60
-            if candle_close_time <= ts:
-                diff = ts - candle_close_time
-                if diff < best_diff:
-                    best_diff = diff
-                    best_idx = idx
-
-        max_gap = interval_min * 60 + 60  # allow up to 1 interval + 60s gap
-        if best_idx is None or best_diff > max_gap:
-            continue
-
-        snapshot = _reconstruct_snapshot(candles, best_idx, interval_min)
-        if snapshot is None:
-            continue
-
-        model_up = fair_prob_up(snapshot, minutes_ahead=0)
+    for i, ts in enumerate(sorted_ts):
         actual = outcomes[ts]
 
-        # Assume market was pricing at ~0.505 (observed default)
+        # Check if this window is consecutive with the previous
+        is_consecutive = (
+            i > 0 and ts - sorted_ts[i - 1] == WINDOW_SECONDS
+        )
+        if not is_consecutive:
+            recent_outcomes = []  # reset on gap
+
+        # Conditional model: P(Up) based on previous outcomes
+        model_up = conditional_prob_up(recent_outcomes)
+
+        # Assume market prices at ~0.505 (confirmed by Gamma API for future windows)
         market_up = 0.505
         edge = model_up - market_up
 
-        # ONLY BUY UP — backtest proved BUY DOWN is anti-predictive (25% win rate)
+        # BUY UP only when we have positive edge
         if edge > edge_threshold:
             side = "BUY UP"
             win_prob = model_up
@@ -293,6 +145,11 @@ def run_backtest(
             win_prob = 0.5
             buy_price = 0.5
             won = False
+
+        # Update outcome history AFTER using it for prediction
+        recent_outcomes.append(actual)
+        if len(recent_outcomes) > 5:
+            recent_outcomes.pop(0)
 
         # Kelly sizing on current bankroll
         bet_size = 0.0

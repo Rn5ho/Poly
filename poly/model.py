@@ -1,20 +1,20 @@
 """Fair-value model for 5-minute Bitcoin up/down markets.
 
-Two strategies:
+Core finding: OUTCOME MEAN-REVERSION is the primary edge.
 
-1. PRE-WINDOW (market ~50/50, window hasn't started):
-   - Weak signal from momentum, main edge is >= rule base rate
-   - Conservative sizing
+48-hour analysis (575 windows) showed:
+  - P(Up | prev Down) = 57.6% — strong signal, BUY UP
+  - P(Up | prev Up)   = 49.2% — no edge
+  - P(Up | prev 2x Up) = 44.3% — anti-predictive, SKIP
+  - Base rate: 53.2% Up (>= resolution rule)
 
-2. IN-PROGRESS (market has swung, window is live):
-   - Market overreacts to early price movement
-   - Use Chainlink oracle price vs window start price to gauge true direction
-   - Mean-reversion at micro timescales creates edge on extreme pricing
-   - Bigger opportunity but higher risk
+Strategy:
+  1. After a Down window → BUY UP (57.6% expected win rate)
+  2. After a single Up → BUY UP at reduced confidence (base rate only)
+  3. After 2+ consecutive Ups → SKIP (44.3% Up rate = negative edge)
 
-The in-progress strategy is the primary edge. BTC 5-min returns are
-near-random at pre-window stage, but markets OVERREACT to early movement
-in live windows, creating mispricing.
+Also supports in-progress window evaluation for live markets
+where pricing has overreacted to early movement.
 """
 
 import math
@@ -26,29 +26,24 @@ from scipy.stats import norm
 from poly.btc import BTCSnapshot
 
 
-# --- Base rate ---
-BASE_PROB_UP = 0.515  # >= resolution rule gives Up a structural edge
-
-# --- Pre-window momentum parameters ---
-MOMENTUM_WEIGHT = 0.15  # conservative: momentum is weak at 5-min scale
-SECONDARY_WEIGHT_RATIO = 0.3
-MOMENTUM_HALFLIFE_MIN = 10.0
+# --- Conditional probabilities from 48h analysis ---
+PROB_UP_AFTER_DOWN = 0.576    # P(Up | prev was Down)
+PROB_UP_AFTER_UP = 0.492      # P(Up | prev was Up)
+PROB_UP_AFTER_2X_UP = 0.443   # P(Up | prev 2 were Up)
+PROB_UP_BASE = 0.532          # unconditional base rate
 
 # --- In-progress parameters ---
-# How much to trust market vs model for live windows
-# As more time passes, market becomes more accurate
-MARKET_TRUST_AT_START = 0.3  # at t=0, trust market 30%
-MARKET_TRUST_AT_END = 0.95   # at t=5min, trust market 95%
-# Mean-reversion factor: how much extreme market prices overstate direction
-MEAN_REVERSION_STRENGTH = 0.20  # pull 20% back toward 50% from extreme
+MARKET_TRUST_AT_START = 0.3
+MARKET_TRUST_AT_END = 0.95
+MEAN_REVERSION_STRENGTH = 0.20
 
-# --- Probability bounds ---
+# --- Bounds ---
 PROB_FLOOR = 0.05
 PROB_CEIL = 0.95
 
 # --- Edge thresholds ---
 DEFAULT_EDGE_THRESHOLD = 0.03
-IN_PROGRESS_EDGE_THRESHOLD = 0.05  # higher bar for live windows (more uncertainty)
+IN_PROGRESS_EDGE_THRESHOLD = 0.05
 
 # --- Kelly ---
 KELLY_FRACTION = 0.5  # half-Kelly
@@ -69,9 +64,9 @@ class Signal:
     model_prob_up: float
     market_prob_up: float
     edge: float
-    side: str  # "BUY UP", "BUY DOWN", or "NO EDGE"
+    side: str  # "BUY UP" or "NO EDGE"
     expected_value: float
-    kelly_fraction: float  # optimal bet size (fraction of bankroll)
+    kelly_fraction: float
     best_bid: float
     best_ask: float
     spread: float
@@ -79,41 +74,36 @@ class Signal:
     tradeable: bool
     in_progress: bool = False
     seconds_remaining: float = 0.0
+    prev_outcome: str = ""  # "Up", "Down", or "" if unknown
 
 
-def fair_prob_up_prewindow(
-    snapshot: BTCSnapshot, minutes_ahead: float = 0.0
+def conditional_prob_up(
+    prev_outcomes: list[str],
 ) -> float:
-    """Calculate P(Up) for a window that hasn't started yet.
+    """Calculate P(Up) based on previous window outcomes.
 
-    Conservative: mainly base rate + weak momentum signal.
+    This is the core model: mean-reversion in 5-min BTC outcomes.
+
+    Args:
+        prev_outcomes: list of recent outcomes, most recent last.
+                       e.g. ["Up", "Down"] means second-to-last was Up,
+                       last was Down.
     """
-    vol_annual = snapshot.volatility_1m
-    if vol_annual <= 0:
-        vol_annual = snapshot.volatility_1h
-    if vol_annual <= 0:
-        return BASE_PROB_UP
+    if not prev_outcomes:
+        return PROB_UP_BASE
 
-    tau = 5.0 / 525_960
-    sigma_5m = vol_annual * math.sqrt(tau)
-    if sigma_5m <= 0:
-        return BASE_PROB_UP
+    last = prev_outcomes[-1]
 
-    mom_5m = snapshot.momentum_5m
-    mom_15m = snapshot.momentum_15m
+    # Check for 2+ consecutive Ups
+    if len(prev_outcomes) >= 2 and prev_outcomes[-1] == "Up" and prev_outcomes[-2] == "Up":
+        return PROB_UP_AFTER_2X_UP
 
-    # Simple weighted momentum (no asymmetric hack — be honest)
-    raw_mom = MOMENTUM_WEIGHT * mom_5m + (MOMENTUM_WEIGHT * SECONDARY_WEIGHT_RATIO) * mom_15m
-
-    # Decay for future windows
-    decay = 0.5 ** (minutes_ahead / MOMENTUM_HALFLIFE_MIN)
-    mom_signal = raw_mom * decay
-
-    base_shift = norm.ppf(BASE_PROB_UP) * sigma_5m
-    z = (base_shift + mom_signal) / sigma_5m
-    prob = float(norm.cdf(z))
-
-    return max(PROB_FLOOR, min(PROB_CEIL, prob))
+    if last == "Down":
+        return PROB_UP_AFTER_DOWN
+    elif last == "Up":
+        return PROB_UP_AFTER_UP
+    else:
+        return PROB_UP_BASE
 
 
 def fair_prob_up_inprogress(
@@ -123,56 +113,38 @@ def fair_prob_up_inprogress(
 ) -> float:
     """Calculate P(Up) for a window that's currently live.
 
-    The market price reflects trader consensus on the current direction.
-    But markets overreact — if BTC dipped 0.05% in 2 minutes, the market
-    might price Down at 85%, but mean-reversion makes the true probability
-    closer to 65%.
-
-    As more time passes (closer to resolution), the market becomes more
-    accurate and we trust it more.
+    Markets overreact to early price movement. Apply mean-reversion
+    that fades as the window nears resolution.
     """
     window_seconds = 300.0
     time_fraction = min(seconds_elapsed / window_seconds, 1.0)
 
-    # How much to trust the market at this point in the window
     market_trust = MARKET_TRUST_AT_START + (
         MARKET_TRUST_AT_END - MARKET_TRUST_AT_START
     ) * time_fraction
 
-    # Mean-reversion adjustment: pull extreme market prices back toward base
-    # More reversion when less time has passed (market overreacts early)
     reversion_strength = MEAN_REVERSION_STRENGTH * (1 - time_fraction)
-    adjusted_market = market_prob_up + reversion_strength * (BASE_PROB_UP - market_prob_up)
+    adjusted_market = market_prob_up + reversion_strength * (PROB_UP_BASE - market_prob_up)
 
-    # Blend market signal with our base rate
-    model_prob = market_trust * adjusted_market + (1 - market_trust) * BASE_PROB_UP
-
-    # If we have a snapshot, add a small momentum nudge
-    if snapshot:
-        mom_nudge = snapshot.momentum_5m * 0.05  # tiny weight
-        model_prob += mom_nudge
+    model_prob = market_trust * adjusted_market + (1 - market_trust) * PROB_UP_BASE
 
     return max(PROB_FLOOR, min(PROB_CEIL, model_prob))
 
 
-# Keep backward compatibility
+# Backward compatibility
 def fair_prob_up(snapshot: BTCSnapshot, minutes_ahead: float = 0.0) -> float:
-    """Calculate fair P(Up). Delegates to pre-window model."""
-    return fair_prob_up_prewindow(snapshot, minutes_ahead)
+    """Legacy function. Returns base rate probability."""
+    return PROB_UP_BASE
 
 
 def kelly_fraction_calc(prob: float, odds: float = 1.0) -> float:
-    """Calculate Kelly criterion bet fraction (half-Kelly).
-
-    f* = (p * (b + 1) - 1) / b, then halved for safety.
-    """
+    """Half-Kelly bet fraction."""
     if prob <= 0.5:
         return 0.0
     f = (prob * (odds + 1) - 1) / odds
     return max(0.0, f * KELLY_FRACTION)
 
 
-# Backward compat alias
 kelly_fraction = kelly_fraction_calc
 
 
@@ -180,16 +152,21 @@ def evaluate_5m_market(
     market,  # FiveMinMarket
     snapshot: BTCSnapshot,
     edge_threshold: float = DEFAULT_EDGE_THRESHOLD,
+    prev_outcomes: list[str] | None = None,
 ) -> Signal:
-    """Evaluate a single 5-minute market and produce a signal.
+    """Evaluate a 5-minute market using the conditional mean-reversion model.
 
-    Uses different strategies for pre-window vs in-progress markets.
+    Args:
+        market: The market to evaluate.
+        snapshot: Current BTC state.
+        edge_threshold: Minimum edge to flag as actionable.
+        prev_outcomes: List of recent window outcomes ["Up", "Down", ...].
+                       Most recent last. Used for conditional probability.
     """
     is_live = market.is_in_progress
     market_up = market.mid if market.mid > 0 else market.up_price
 
     if is_live:
-        # IN-PROGRESS: use market price + mean-reversion model
         model_up = fair_prob_up_inprogress(
             market_prob_up=market_up,
             seconds_elapsed=market.seconds_elapsed,
@@ -197,15 +174,13 @@ def evaluate_5m_market(
         )
         threshold = max(edge_threshold, IN_PROGRESS_EDGE_THRESHOLD)
     else:
-        # PRE-WINDOW: use momentum model
-        minutes_ahead = market.minutes_until_start
-        model_up = fair_prob_up_prewindow(snapshot, minutes_ahead)
+        # Conditional model: use previous outcomes
+        model_up = conditional_prob_up(prev_outcomes or [])
         threshold = edge_threshold
 
     edge = model_up - market_up
 
-    # ONLY BUY UP. Backtest showed BUY DOWN is anti-predictive (25% win rate).
-    # The >= resolution rule gives Up a structural edge; Down signals are noise.
+    # BUY UP only. Skip after 2+ consecutive Ups (negative edge).
     if edge > threshold:
         side = "BUY UP"
         win_prob = model_up
@@ -223,6 +198,8 @@ def evaluate_5m_market(
         kf = kelly_fraction_calc(win_prob, net_odds)
     else:
         kf = 0.0
+
+    prev_str = prev_outcomes[-1] if prev_outcomes else ""
 
     return Signal(
         question=market.question,
@@ -246,4 +223,5 @@ def evaluate_5m_market(
         tradeable=market.is_tradeable,
         in_progress=is_live,
         seconds_remaining=market.seconds_until_end if is_live else 0,
+        prev_outcome=prev_str,
     )

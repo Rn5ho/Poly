@@ -14,8 +14,8 @@ import time
 from datetime import datetime, timezone
 
 from poly.btc import get_snapshot
-from poly.model import evaluate_5m_market, fair_prob_up
-from poly.polymarket import fetch_5m_markets
+from poly.model import conditional_prob_up, evaluate_5m_market
+from poly.polymarket import fetch_5m_markets, fetch_recent_outcomes
 
 
 def scan(edge_threshold: float = 0.03, future_windows: int = 12) -> None:
@@ -44,14 +44,22 @@ def scan(edge_threshold: float = 0.03, future_windows: int = 12) -> None:
         print("\n  No tradeable markets found.")
         return
 
-    model_now = fair_prob_up(snap, minutes_ahead=0)
-    mom_dir = "UP" if snap.momentum_5m > 0 else "DOWN" if snap.momentum_5m < 0 else "FLAT"
-    print(f"\n[3/3] Model P(Up) next window = {model_now:.1%}  |  Momentum: {mom_dir}  |  Threshold: {edge_threshold:.0%}")
+    # Fetch recent resolved outcomes for conditional model
+    print("\n[3/4] Fetching recent outcomes for conditional model...")
+    prev_outcomes = fetch_recent_outcomes(n=3)
+    if prev_outcomes:
+        outcomes_str = " → ".join(prev_outcomes)
+        print(f"  Recent: {outcomes_str}")
+    else:
+        print("  No recent outcomes available (using base rate)")
+
+    model_up = conditional_prob_up(prev_outcomes)
+    print(f"\n[4/4] Conditional P(Up) = {model_up:.1%}  |  Threshold: {edge_threshold:.0%}")
     print()
 
     signals = []
     for m in tradeable:
-        sig = evaluate_5m_market(m, snap, edge_threshold)
+        sig = evaluate_5m_market(m, snap, edge_threshold, prev_outcomes=prev_outcomes)
         signals.append(sig)
 
     signals.sort(key=lambda s: (s.side == "NO EDGE", s.window_start))
@@ -134,8 +142,16 @@ def trade(
         print("  No tradeable markets. Waiting...")
         return
 
+    # Fetch recent outcomes for conditional model
+    prev_outcomes = fetch_recent_outcomes(n=3)
+    if prev_outcomes:
+        outcomes_str = " → ".join(prev_outcomes)
+        print(f"  Recent outcomes: {outcomes_str}")
+        model_up = conditional_prob_up(prev_outcomes)
+        print(f"  Conditional P(Up): {model_up:.1%}")
+
     # Evaluate all tradeable windows, prefer in-progress with edge
-    signals = [evaluate_5m_market(m, snap, edge_threshold) for m in tradeable]
+    signals = [evaluate_5m_market(m, snap, edge_threshold, prev_outcomes=prev_outcomes) for m in tradeable]
     actionable = [s for s in signals if s.side != "NO EDGE"]
 
     if actionable:
@@ -198,7 +214,8 @@ def _print_signal(sig) -> None:
     print(f"      Model: {sig.model_prob_up:.1%} Up  |  {mkt_label}  |  Edge: {sig.edge:+.1%}")
     print(f"      Mom: {sig.momentum_5m:+.3%}  |  Vol: {sig.vol_1m:.1%}  |  Spread: {sig.spread:.2f}  |  Liq: ${sig.liquidity:,.0f}")
     if sig.side != "NO EDGE":
-        print(f"      Kelly: {sig.kelly_fraction:.1%}  |  EV: {sig.expected_value:+.1%}")
+        prev_str = f"  |  Prev: {sig.prev_outcome}" if sig.prev_outcome else ""
+        print(f"      Kelly: {sig.kelly_fraction:.1%}  |  EV: {sig.expected_value:+.1%}{prev_str}")
     print("-" * 72)
 
 
