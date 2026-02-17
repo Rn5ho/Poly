@@ -1,58 +1,67 @@
 # CLAUDE.md — Poly
 
-This file provides guidance for AI assistants (and developers) working in this repository.
-
-## Repository Overview
-
-**Poly** is a new project. This document will evolve as the codebase grows.
+Polymarket BTC mispricing scanner. Compares Polymarket's crowd-priced Bitcoin up/down markets against a quantitative fair-value model to find profitable edges.
 
 ## Project Structure
 
 ```
 Poly/
-├── CLAUDE.md          # AI assistant guidance (this file)
-└── (empty — project scaffolding pending)
+├── CLAUDE.md              # This file
+├── requirements.txt       # Python dependencies
+└── poly/                  # Main package
+    ├── __init__.py
+    ├── main.py            # CLI entry point — scan & display signals
+    ├── btc.py             # BTC spot price (CoinGecko/Coinbase) & realized volatility (Kraken OHLC)
+    ├── polymarket.py      # Polymarket market discovery via slug-probing (Gamma + CLOB APIs)
+    └── model.py           # Fair-value pricing (log-normal / binary option math) & edge detection
 ```
 
-As the project develops, update this section to reflect the directory layout, key modules, and entry points.
+## How It Works
 
-## Development Workflow
-
-### Getting Started
-
-1. Clone the repository
-2. Install dependencies (update this section once a package manager / build system is chosen)
-3. Run the project (update once an entry point exists)
-
-### Branching
-
-- Feature branches use the pattern `claude/<description>-<id>` for AI-assisted work.
-- Keep commits focused and descriptive.
-
-### Testing
-
-No test framework has been configured yet. Update this section when one is added.
-
-### Linting / Formatting
-
-No linter or formatter has been configured yet. Update this section when one is added.
-
-## Conventions
-
-- **Keep this file up to date.** Whenever significant project structure, tooling, or workflow changes are made, reflect them here.
-- Prefer simple, direct solutions over abstractions until complexity warrants them.
-- Document decisions that would not be obvious from reading the code alone.
+1. **Fetch BTC data** — current spot price and annualized realized volatility from hourly closes
+2. **Discover markets** — generate slug patterns for known Polymarket BTC strike markets, probe each via Gamma API in parallel
+3. **Price each market** — calculate `P(BTC > strike at expiry)` using the log-normal model:
+   ```
+   P = Φ(d₂)  where  d₂ = [ln(S/K) - (σ²/2)·τ] / (σ·√τ)
+   ```
+4. **Detect edge** — compare model probability to market's implied probability. Flag when `|edge| > threshold`
 
 ## Key Commands
 
-<!-- Add commands here as the project matures, e.g.: -->
-<!-- npm install        # Install dependencies -->
-<!-- npm run build      # Build the project -->
-<!-- npm test           # Run tests -->
-<!-- npm run lint       # Lint the codebase -->
+```bash
+pip install -r requirements.txt          # Install dependencies
+python -m poly.main                      # Run scanner (default: 3% edge threshold)
+python -m poly.main -e 0.02              # Lower edge threshold to 2%
+python -m poly.main -w 72                # Use 72h volatility window (default: 168h)
+python -m poly.main -e 0.05 -w 48        # Combine options
+```
 
-No commands configured yet.
+## External APIs (no auth required)
+
+| API | Base URL | Used For |
+|-----|----------|----------|
+| CoinGecko | `api.coingecko.com/api/v3` | BTC spot price (primary) |
+| Coinbase | `api.coinbase.com/v2` | BTC spot price (fallback) |
+| Kraken | `api.kraken.com/0/public` | Hourly OHLC candles for volatility |
+| Polymarket Gamma | `gamma-api.polymarket.com` | Market discovery & metadata |
+| Polymarket CLOB | `clob.polymarket.com` | Order book & token prices |
+
+**Important**: Binance API is geo-blocked in some environments (returns 451). That's why we use Kraken for OHLC data.
+
+**Important**: Gamma API search/filter params (`tag`, `slug_contains`, `title_contains`) are unreliable — they return unrelated results. Discovery works by **generating exact slugs** and probing each directly.
+
+## Conventions
+
+- **Python 3.11+** — uses `X | None` union syntax
+- Pure Python, no frameworks — just `requests`, `scipy`, `numpy`
+- All prices are floats; all timestamps are UTC `datetime` objects
+- Polymarket markets use `condition_id` (hex) as the primary key
+- Edge = `model_probability - market_probability` (positive = YES is underpriced)
+- Default edge threshold is 3% — accounts for spread, fees, and model noise
 
 ## Architecture Notes
 
-Update this section with high-level architecture decisions, data flow, and module responsibilities as the project takes shape.
+- **No trading/execution** — this is signal generation only. Placing trades requires Polymarket wallet integration (separate concern).
+- **Slug-based discovery** is necessary because the Gamma API's filtering is broken. Slug patterns are generated for `bitcoin-above-{N}k-on-{month}-{day}` and `bitcoin-up-or-down-{month}-{day}-{time}`. The strike list in `polymarket.py:BTC_STRIKES_K` may need updating if Polymarket adds new strike levels.
+- **Volatility model** uses realized vol from hourly log returns, annualized via `σ_annual = σ_hourly × √8760`. The 168h (7-day) default window balances recency with stability.
+- **Drift is set to zero** — for sub-week timeframes, BTC's expected return is negligible vs. its volatility, so the risk-neutral and real-world probabilities are nearly identical.
