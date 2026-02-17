@@ -50,8 +50,23 @@ class FiveMinMarket:
         return max(self.window_start - time.time(), 0)
 
     @property
+    def seconds_until_end(self) -> float:
+        return max(self.window_end - time.time(), 0)
+
+    @property
+    def seconds_elapsed(self) -> float:
+        """Seconds elapsed since window start (0 if not started)."""
+        return max(time.time() - self.window_start, 0)
+
+    @property
     def minutes_until_start(self) -> float:
         return self.seconds_until_start / 60
+
+    @property
+    def is_in_progress(self) -> bool:
+        """True if this window is currently live (started but not ended)."""
+        now = time.time()
+        return self.window_start <= now < self.window_end and not self.closed
 
     @property
     def is_tradeable(self) -> bool:

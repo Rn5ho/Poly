@@ -28,7 +28,8 @@ def scan(edge_threshold: float = 0.03, future_windows: int = 12) -> None:
 
     print("\n[1/3] Fetching BTC snapshot...")
     snap = get_snapshot()
-    print(f"  Price:        ${snap.price:,.2f}")
+    price_src = "Chainlink" if snap.chainlink_price else "Exchange"
+    print(f"  Price:        ${snap.price:,.2f} ({price_src})")
     print(f"  Momentum 5m:  {snap.momentum_5m:+.4%}")
     print(f"  Momentum 15m: {snap.momentum_15m:+.4%}")
     print(f"  Vol (1m):     {snap.volatility_1m:.1%} ann.")
@@ -81,16 +82,26 @@ def watch(edge_threshold: float = 0.03, interval: int = 60) -> None:
             return
 
 
-def backtest(hours: int = 6, edge_threshold: float = 0.03) -> None:
+def backtest(
+    hours: int = 6,
+    edge_threshold: float = 0.03,
+    bankroll: float = 100.0,
+    max_bet: float = 0.0,
+) -> None:
     """Run backtest against resolved markets."""
     from poly.backtest import print_backtest, run_backtest
 
     print("=" * 72)
-    print(f"  BACKTEST — Last {hours} hours")
+    print(f"  BACKTEST — Last {hours} hours  |  Starting bankroll: ${bankroll:,.2f}")
     print("=" * 72)
     print()
 
-    result = run_backtest(hours=hours, edge_threshold=edge_threshold)
+    result = run_backtest(
+        hours=hours,
+        edge_threshold=edge_threshold,
+        bankroll=bankroll,
+        max_bet=max_bet,
+    )
     print_backtest(result)
 
 
@@ -114,7 +125,8 @@ def trade(
     print("=" * 72)
 
     snap = get_snapshot()
-    print(f"\n  BTC: ${snap.price:,.2f}  |  Mom 5m: {snap.momentum_5m:+.4%}  |  Vol: {snap.volatility_1m:.1%}")
+    price_src = "Chainlink" if snap.chainlink_price else "Exchange"
+    print(f"\n  BTC: ${snap.price:,.2f} ({price_src})  |  Mom 5m: {snap.momentum_5m:+.4%}  |  Vol: {snap.volatility_1m:.1%}")
 
     markets = fetch_5m_markets(past_windows=0, future_windows=3)
     tradeable = [m for m in markets if m.is_tradeable]
@@ -122,11 +134,19 @@ def trade(
         print("  No tradeable markets. Waiting...")
         return
 
-    # Only evaluate the nearest window
-    nearest = tradeable[0]
-    sig = evaluate_5m_market(nearest, snap, edge_threshold)
+    # Evaluate all tradeable windows, prefer in-progress with edge
+    signals = [evaluate_5m_market(m, snap, edge_threshold) for m in tradeable]
+    actionable = [s for s in signals if s.side != "NO EDGE"]
 
-    print(f"\n  Window: {sig.question}")
+    if actionable:
+        # Prefer in-progress signals, then by absolute edge
+        actionable.sort(key=lambda s: (-s.in_progress, -abs(s.edge)))
+        sig = actionable[0]
+    else:
+        sig = signals[0]
+
+    live_str = f" [{int(sig.seconds_remaining)}s left]" if sig.in_progress else ""
+    print(f"\n  Window: {sig.question}{live_str}")
     print(f"  Model: {sig.model_prob_up:.1%} Up  |  Market: {sig.market_prob_up:.1%}  |  Edge: {sig.edge:+.1%}")
 
     if sig.side == "NO EDGE":
@@ -162,18 +182,20 @@ def _print_signal(sig) -> None:
 
     if sig.side != "NO EDGE":
         marker = ">>> "
-        label = f"*** {sig.side} ***"
     else:
         marker = "    "
-        label = "no edge"
 
-    if sig.minutes_until <= 0:
+    if sig.in_progress:
+        remaining = int(sig.seconds_remaining)
+        status = f" [LIVE {remaining}s left]"
+    elif sig.minutes_until <= 0:
         status = " [LIVE]"
     else:
         status = f" [in {sig.minutes_until:.0f}m]"
 
     print(f"{marker}{window_str}{status}  {sig.question}")
-    print(f"      Model: {sig.model_prob_up:.1%} Up  |  Market: {sig.market_prob_up:.1%}  |  Edge: {sig.edge:+.1%}")
+    mkt_label = f"Market: {sig.market_prob_up:.0%} Up/{1-sig.market_prob_up:.0%} Dn"
+    print(f"      Model: {sig.model_prob_up:.1%} Up  |  {mkt_label}  |  Edge: {sig.edge:+.1%}")
     print(f"      Mom: {sig.momentum_5m:+.3%}  |  Vol: {sig.vol_1m:.1%}  |  Spread: {sig.spread:.2f}  |  Liq: ${sig.liquidity:,.0f}")
     if sig.side != "NO EDGE":
         print(f"      Kelly: {sig.kelly_fraction:.1%}  |  EV: {sig.expected_value:+.1%}")
@@ -220,6 +242,8 @@ def main():
     p_bt = sub.add_parser("backtest", help="Validate model against history")
     p_bt.add_argument("-H", "--hours", type=int, default=6)
     p_bt.add_argument("-e", "--edge", type=float, default=0.03)
+    p_bt.add_argument("-b", "--bankroll", type=float, default=100.0, help="Starting bankroll (default $100)")
+    p_bt.add_argument("-m", "--max-bet", type=float, default=0.0, help="Max bet per trade (default: 10%% of bankroll)")
 
     # trade
     p_trade = sub.add_parser("trade", help="Live trading (or dry run)")
@@ -236,7 +260,12 @@ def main():
         elif args.command == "watch":
             watch(edge_threshold=args.edge, interval=args.interval)
         elif args.command == "backtest":
-            backtest(hours=args.hours, edge_threshold=args.edge)
+            backtest(
+                hours=args.hours,
+                edge_threshold=args.edge,
+                bankroll=args.bankroll,
+                max_bet=args.max_bet,
+            )
         elif args.command == "trade":
             trade(
                 edge_threshold=args.edge,
