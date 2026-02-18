@@ -423,6 +423,45 @@ def run_bot(
     print(flush=True)
 
 
+def _catch_up_outcomes(state: BotState) -> None:
+    """Fetch outcomes for any windows between last processed and now.
+
+    The bot takes ~6 minutes per cycle (5-min window + 60s resolution wait),
+    so it can fall behind and miss windows. This fills in the gaps so that
+    recent_outcomes always reflects the true sequence.
+    """
+    if not state.last_window_ts:
+        return
+
+    now = int(time.time())
+    current_window = (now // WINDOW_SECONDS) * WINDOW_SECONDS
+
+    # Collect windows that have ended but weren't processed
+    missed = []
+    ts = state.last_window_ts + WINDOW_SECONDS
+    while ts < current_window:  # only windows that have fully ended
+        missed.append(ts)
+        ts += WINDOW_SECONDS
+
+    if not missed:
+        return
+
+    _print(f"  Catching up {len(missed)} missed window(s)...")
+    for ts in missed:
+        outcome = _fetch_resolved_outcome(ts)
+        if outcome:
+            state.recent_outcomes.append(outcome)
+            if len(state.recent_outcomes) > 5:
+                state.recent_outcomes.pop(0)
+            state.last_window_ts = ts
+        else:
+            # Window not yet resolved — stop catching up here
+            break
+
+    if missed:
+        _print(f"  Outcomes now: {' → '.join(state.recent_outcomes[-5:])}")
+
+
 def _run_one_cycle(
     state: BotState,
     edge_threshold: float,
@@ -435,6 +474,9 @@ def _run_one_cycle(
     shutdown_event: threading.Event | None = None,
 ) -> None:
     """Run a single trade cycle: wait → book → evaluate → trade → verify → monitor → resolve."""
+
+    # Catch up on any missed windows before evaluating
+    _catch_up_outcomes(state)
 
     # Determine the next window to trade
     next_ts = _next_window_ts()
