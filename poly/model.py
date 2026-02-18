@@ -39,27 +39,41 @@ MAX_BET_PCT = 0.10  # never bet more than 10% of bankroll
 MIN_BET = 5.0  # Polymarket minimum
 
 # Polymarket fee model (5-min crypto markets)
-# Taker fee: parabolic curve fee(p) = p * (1-p) * FEE_RATE_BASE
-# Max ~0.44% at p=0.50. Maker orders are fee-free.
-# Fee is deducted from shares received, not USDC spent.
-FEE_RATE_BASE = 0.0175  # 175 bps base rate for 5-min crypto
+# Official formula from docs.polymarket.com/developers/market-makers/maker-rebates-program:
+#   fee = C * p * feeRate * (p * (1-p))^exponent
+# where C=shares, p=price. Fee collected as shares on buys, USDC on sells.
+#
+# 5-min & 15-min crypto: feeRate=0.25, exponent=2, max effective=1.56% at p=0.50
+# Sports (NCAAB, Serie A): feeRate=0.0175, exponent=1, max effective=0.44% at p=0.50
+# Maker orders: $0 fee (+ eligible for 20% rebate pool)
+FEE_RATE = 0.25  # 5-min crypto fee rate
+FEE_EXPONENT = 2  # 5-min crypto exponent (squared curve)
 DEFAULT_BUY_PRICE = 0.510  # typical ask price (bid=0.50, ask=0.51, mid=0.505)
 
 
 def taker_fee_rate(price: float) -> float:
-    """Polymarket taker fee per share at given price.
+    """Polymarket taker fee as fraction of share price.
 
-    5-min crypto markets use a parabolic fee curve:
-    fee = p * (1-p) * 0.0175, max ~0.44% at p=0.50.
+    5-min crypto: effective_rate = 0.25 * (p*(1-p))^2
+    Max ~1.56% at p=0.50, drops toward 0 at extremes.
+
+    Source: docs.polymarket.com/developers/market-makers/maker-rebates-program
     """
-    return price * (1 - price) * FEE_RATE_BASE
+    return FEE_RATE * (price * (1 - price)) ** FEE_EXPONENT
 
 
 def net_odds_after_fees(buy_price: float, is_maker: bool = False) -> float:
     """Net profit per $1 bet after fees and spread.
 
-    As taker buying at ask: shares = (1/ask) * (1 - fee), payout = shares * $1
-    As maker buying at mid: shares = 1/mid, payout = shares * $1 (no fee)
+    Winning shares pay exactly $1.00 at settlement (no settlement fee).
+    Taker fee is deducted from shares received at entry.
+
+    As taker buying at ask $0.510 with 1.56% fee:
+      shares = (1/0.510) * (1 - 0.01561) = 1.9302
+      net_odds = 0.9302 (profit per $1 on win)
+    As maker buying at mid $0.505, no fee:
+      shares = 1/0.505 = 1.9802
+      net_odds = 0.9802
     """
     fee = 0.0 if is_maker else taker_fee_rate(buy_price)
     shares_per_dollar = (1.0 / buy_price) * (1 - fee)

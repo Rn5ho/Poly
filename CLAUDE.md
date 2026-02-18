@@ -68,11 +68,29 @@ python -m poly.autobot                             # Direct module execution
 
 5-minute crypto markets have **taker-only fees** (since launch Feb 12, 2026). Maker orders are free.
 
-### Fee Structure
-- **Taker fee**: parabolic `fee(p) = p * (1-p) * 0.0175`, max ~0.44% at p=0.50
-- **Maker fee**: $0 (+ eligible for 20% rebate of taker fee pool)
+Source: `docs.polymarket.com/developers/market-makers/maker-rebates-program`
+
+### Fee Formula
+
+```
+fee = C × p × feeRate × (p × (1-p))^exponent
+```
+where C=shares, p=price. Fee collected as shares on buys, USDC on sells.
+
+| Market Type | feeRate | Exponent | Max Effective | Maker Rebate |
+|-------------|---------|----------|---------------|-------------|
+| **5-min & 15-min crypto** | **0.25** | **2** | **1.56% at p=0.50** | 20% |
+| Sports (NCAAB, Serie A) | 0.0175 | 1 | 0.44% at p=0.50 | 25% |
+
+### Other Rules
+- **Maker fee**: $0 (+ eligible for rebate pool)
 - **Settlement**: winning shares pay exactly $1.00, no fee at payout
 - **Losing shares**: worth $0, you lose the full purchase price
+- **No trading size limits** (but large orders impact price)
+- **FOK**: Fill-or-Kill market orders, always taker
+- **GTC/GTD**: Limit orders, maker if they rest on book
+- **Post-only**: Rejected if would immediately match (guaranteed maker)
+- **Resolution**: UMA Optimistic Oracle, 2-hour challenge period
 
 ### Typical Market Pricing
 - **Bid**: $0.500, **Ask**: $0.510, **Spread**: $0.01, **Mid**: $0.505
@@ -83,18 +101,18 @@ python -m poly.autobot                             # Direct module execution
 | Component | Value |
 |-----------|-------|
 | Buy price (ask) | $0.510 |
-| Taker fee | 0.44% (deducted from shares received) |
-| Net odds on win | 0.9522 ($0.9522 profit per $1 bet) |
+| Taker fee | **1.56%** (deducted from shares received) |
+| Net odds on win | **0.9302** ($0.9302 profit per $1 bet) |
 | Net odds without fees | 0.9802 |
-| **Total cost drag** | **2.9% of gross odds** |
+| **Total cost drag** | **5.1% of gross odds** |
 
-| Signal | EV per $1 (with fees) | EV per $1 (no fees) |
-|--------|----------------------|---------------------|
-| After 1x Down (56.0%) | +$0.093 (+9.3%) | +$0.109 (+10.9%) |
-| After 2x Down (57.6%) | +$0.125 (+12.5%) | +$0.141 (+14.1%) |
-| After 3x Down (59.0%) | +$0.152 (+15.2%) | +$0.168 (+16.8%) |
+| Signal | EV per $1 (taker) | EV per $1 (maker) | EV (no fees) |
+|--------|-------------------|-------------------|-------------|
+| After 1x Down (56.0%) | **+$0.081 (+8.1%)** | +$0.109 (+10.9%) | +$0.109 |
+| After 2x Down (57.6%) | **+$0.112 (+11.2%)** | +$0.141 (+14.1%) | +$0.141 |
+| After 3x Down (59.0%) | **+$0.139 (+13.9%)** | +$0.168 (+16.8%) | +$0.168 |
 
-**Bottom line**: Fees eat ~15% of gross EV. The edge survives comfortably.
+**Bottom line**: Taker fees eat ~25% of gross EV. The edge still survives clearly. Maker orders would eliminate fees entirely.
 
 ## Model Design
 
@@ -120,13 +138,13 @@ After a Down window, the next window has a higher-than-market probability of bei
 ### Backtest Results (fee-aware, $500 start, quarter-Kelly)
 
 - **Win rate**: 56.0% over 861 trades
-- **P&L**: $500 → $4,288 (+758% ROI)
-- **Max drawdown**: 40.4%
+- **P&L**: $500 → $2,812 (+462% ROI)
+- **Max drawdown**: 38.4%
 - **Zero ruin risk** at $500+ starting bankroll
-- **Avg bet**: $60, **Avg P&L/trade**: +$4.40
+- **Avg bet**: $40, **Avg P&L/trade**: +$2.68
 
 ### Without fees (for comparison)
-- **P&L**: $500 → $7,656 (+1,431% ROI) — fees reduce returns by ~45%
+- **P&L**: $500 → $7,656 (+1,431% ROI) — 1.56% taker fees reduce compounded returns by ~63%
 
 ### Model Parameters (`model.py`)
 
@@ -142,21 +160,22 @@ After a Down window, the next window has a higher-than-market probability of bei
 | `KELLY_MULTIPLIER` | 0.25 | Quarter-Kelly (0% ruin at $500+) |
 | `MAX_BET_PCT` | 0.10 | Never bet > 10% of bankroll |
 | `MIN_BET` | 5.0 | Polymarket minimum order |
-| `FEE_RATE_BASE` | 0.0175 | 5-min crypto taker fee (175 bps) |
+| `FEE_RATE` | 0.25 | 5-min crypto fee rate (from Polymarket docs) |
+| `FEE_EXPONENT` | 2 | Squared curve for crypto markets |
 | `DEFAULT_BUY_PRICE` | 0.510 | Typical ask price on these markets |
 
 ### Position Sizing
 
 Quarter-Kelly criterion (0.25x full Kelly) with **fee-adjusted odds**:
 - `net_odds = (1/buy_price) * (1 - taker_fee) - 1`
-- At P(Up)=57.6%, net_odds=0.9522: quarter-Kelly = 3.3% of bankroll
+- At P(Up)=57.6%, net_odds=0.9302: quarter-Kelly = 3.0% of bankroll
 - Max capped at 10% of bankroll
 - Minimum: $5 (Polymarket minimum)
 
 **Why quarter-Kelly?** Ruin analysis over 863 trades:
 - Half-Kelly ($100 start): 35.6% chance of bot death (bankroll < $5 min bet)
-- Quarter-Kelly ($500 start): 0% death rate, 40.4% max drawdown
-- Half-Kelly ($500 start): 0% death rate, but 66.7% max drawdown
+- Quarter-Kelly ($500 start): 0% death rate, 38.4% max drawdown
+- Half-Kelly ($500 start): 0% death rate, higher max drawdown
 
 ### Rolling Win Rate Stability
 
@@ -230,8 +249,8 @@ export POLY_FUNDER="0x..."           # Optional: proxy wallet address
 
 - **Outcome mean-reversion** is the core insight: After Down windows, Up probability increases. Deeper Down streaks → stronger signal. Discovered through 1,823-window calibration.
 - **BUY DOWN is dead**: No bearish conditional pattern survives 95% CI testing. The model is BUY UP only.
-- **Quarter-Kelly** is the sizing sweet spot: Enough to compound (758% ROI over 6 days with fees) but 0% ruin risk at $500+ bankroll and manageable 40.4% max drawdown.
-- **Fees are real but survivable**: 0.44% taker fee + 1¢ spread = ~2.9% drag on odds. The 5.0-8.0% edge absorbs this.
+- **Quarter-Kelly** is the sizing sweet spot: Enough to compound (462% ROI over 6 days with fees) but 0% ruin risk at $500+ bankroll and manageable 38.4% max drawdown.
+- **Fees are significant but survivable**: 1.56% taker fee + 1¢ spread = ~5.1% drag on gross odds. The 5.0-8.0% edge absorbs this. Maker orders would eliminate fees entirely.
 - **Resolution source is Chainlink**, not exchange spot prices.
 - **Autobot waits for every window** even when not trading, to keep the outcome sequence current for conditional model.
 - **Maker orders eliminate fees entirely** — future optimization could use limit orders placed early to get maker status and collect rebates.
