@@ -1,0 +1,25 @@
+[Unit]
+Description=Poly Autobot — 5-min BTC trading bot
+After=network.target
+
+[Service]
+Type=simple
+User=poly
+WorkingDirectory=/opt/poly
+ExecStart=/opt/poly/venv/bin/python -m poly.autobot --maker
+Restart=on-failure
+RestartSec=30
+# Environment file for secrets (Telegram, Polymarket keys)
+EnvironmentFile=/opt/poly/.env
+
+# Logging
+StandardOutput=append:/var/log/poly/bot.log
+StandardError=append:/var/log/poly/bot.log
+
+# Safety
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/poly /var/log/poly
+
+[Install]
+WantedBy=multi-user.target

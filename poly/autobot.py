@@ -53,6 +53,17 @@ from poly.model import (
     kelly_fraction,
     net_odds_after_fees,
 )
+from poly.notify import (
+    is_configured as _tg_configured,
+    notify_error,
+    notify_fill,
+    notify_outcome,
+    notify_shutdown,
+    notify_startup,
+    notify_stoploss,
+    notify_trade_placed,
+    send_daily_summary,
+)
 from poly.polymarket import (
     WINDOW_SECONDS,
     _fetch_5m_market,
@@ -353,11 +364,16 @@ def run_bot(
     print("=" * 72)
     print(f"  POLY AUTOBOT ({mode}) — {order_type}")
     print(f"  Bankroll: ${state.bankroll:,.2f}  |  Kelly: {kelly_mult:.0%}  |  Edge: {edge_threshold:.0%}{stoploss_str}")
+    if _tg_configured():
+        print(f"  Telegram: ON")
     print(f"  Started: {state.started_at}")
     if state.total_trades > 0:
         print(f"  Trades: {state.total_trades}  |  WR: {state.win_rate:.1%}  |  P&L: ${state.total_pnl:+,.2f}")
     print("=" * 72)
     print()
+
+    # Notify startup
+    notify_startup(mode, order_type, state.bankroll, kelly_mult, edge_threshold, enable_stoploss)
 
     # Bootstrap recent outcomes if we don't have them
     if not state.recent_outcomes:
@@ -368,6 +384,9 @@ def run_bot(
         else:
             _print("  No recent outcomes (will use base rate)")
 
+    # Daily summary tracking
+    last_daily_summary = 0
+
     # Main loop
     while not shutdown:
         try:
@@ -376,14 +395,23 @@ def run_bot(
                 place_order_fn, sell_fn, use_maker, enable_stoploss,
             )
             state.save()
+
+            # Send daily summary at ~00:00 UTC
+            now_ts = int(time.time())
+            today_midnight = (now_ts // 86400) * 86400
+            if today_midnight > last_daily_summary:
+                send_daily_summary()
+                last_daily_summary = today_midnight
         except KeyboardInterrupt:
             break
         except Exception as e:
             _print(f"ERROR: {e}")
+            notify_error(str(e))
             time.sleep(30)  # back off on errors
 
     # Final save
     state.save()
+    notify_shutdown(state.bankroll, state.total_trades, state.win_rate, state.total_pnl, state.max_drawdown)
     print()
     print("=" * 72)
     print(f"  BOT STOPPED — {_now_utc()}")
@@ -487,6 +515,14 @@ def _run_one_cycle(
 
     _print(f"  >>> BUY UP ({order_label})  |  Bet: ${bet_size:.2f}  |  Kelly: {kf:.1%}  |  Bank: ${state.bankroll:.2f}")
 
+    # Telegram: trade placed
+    window_time = datetime.fromtimestamp(next_ts, tz=timezone.utc).strftime("%H:%M UTC")
+    notify_trade_placed(
+        window_time=window_time, side="BUY UP", order_type=order_label,
+        bet_size=bet_size, buy_price=buy_price, model_prob=model_up,
+        edge=edge, bankroll=state.bankroll, down_streak=down_streak,
+    )
+
     # Place order and verify fill
     shares_requested = bet_size / buy_price
     actual_shares = shares_requested  # will be updated by fill verification
@@ -558,6 +594,8 @@ def _run_one_cycle(
                     )
                     # Adjust bet_size to actual filled amount
                     bet_size = actual_bet
+
+                notify_fill(order_id, actual_shares, shares_requested, fill_fraction)
     else:
         _print(f"  [DRY RUN] Would place ${bet_size:.2f} on BUY UP ({order_label})")
 
@@ -578,6 +616,12 @@ def _run_one_cycle(
         state.total_stopouts += 1
         won = False
         outcome_label = "STOP-LOSS"
+        notify_stoploss(
+            window_time=window_time,
+            exit_price=stoploss_result.get("exit_price", 0),
+            pnl=pnl,
+            recovery_pct=stoploss_result.get("recovery_pct", 0),
+        )
     else:
         # Wait for resolution
         outcome = _wait_for_resolution(next_ts)
@@ -626,6 +670,13 @@ def _run_one_cycle(
         f"Bank: ${state.bankroll:.2f}  |  "
         f"WR: {state.win_rate:.1%} ({state.total_wins}/{state.total_trades})  |  "
         f"DD: {dd:.1%}"
+    )
+
+    # Telegram: outcome
+    notify_outcome(
+        window_time=window_time, outcome=outcome_label, won=won,
+        pnl=pnl, bankroll=state.bankroll, win_rate=state.win_rate,
+        total_trades=state.total_trades, drawdown=dd, stopped_out=stopped_out,
     )
 
     _log_trade({
