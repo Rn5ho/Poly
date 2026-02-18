@@ -26,7 +26,7 @@ def scan(edge_threshold: float = 0.03, future_windows: int = 12) -> None:
     print(f"  {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 72)
 
-    print("\n[1/3] Fetching BTC snapshot...")
+    print("\n[1/4] Fetching BTC snapshot...")
     snap = get_snapshot()
     price_src = "Chainlink" if snap.chainlink_price else "Exchange"
     print(f"  Price:        ${snap.price:,.2f} ({price_src})")
@@ -35,7 +35,7 @@ def scan(edge_threshold: float = 0.03, future_windows: int = 12) -> None:
     print(f"  Vol (1m):     {snap.volatility_1m:.1%} ann.")
     print(f"  Vol (1h):     {snap.volatility_1h:.1%} ann.")
 
-    print("\n[2/3] Discovering 5-minute markets...")
+    print("\n[2/4] Discovering 5-minute markets...")
     markets = fetch_5m_markets(past_windows=2, future_windows=future_windows)
     tradeable = [m for m in markets if m.is_tradeable]
     print(f"  Found {len(markets)} markets ({len(tradeable)} tradeable)")
@@ -48,7 +48,7 @@ def scan(edge_threshold: float = 0.03, future_windows: int = 12) -> None:
     print("\n[3/4] Fetching recent outcomes for conditional model...")
     prev_outcomes = fetch_recent_outcomes(n=3)
     if prev_outcomes:
-        outcomes_str = " → ".join(prev_outcomes)
+        outcomes_str = " -> ".join(prev_outcomes)
         print(f"  Recent: {outcomes_str}")
     else:
         print("  No recent outcomes available (using base rate)")
@@ -128,7 +128,7 @@ def trade(
     now = datetime.now(timezone.utc)
     print("=" * 72)
     mode_str = "DRY RUN" if dry_run else "LIVE"
-    print(f"  TRADE MODE ({mode_str}) — {now.strftime('%H:%M:%S UTC')}")
+    print(f"  TRADE MODE ({mode_str}) -- {now.strftime('%H:%M:%S UTC')}")
     print(f"  Bankroll: ${bankroll:,.2f}  |  Max bet: ${max_bet:,.2f}")
     print("=" * 72)
 
@@ -145,7 +145,7 @@ def trade(
     # Fetch recent outcomes for conditional model
     prev_outcomes = fetch_recent_outcomes(n=3)
     if prev_outcomes:
-        outcomes_str = " → ".join(prev_outcomes)
+        outcomes_str = " -> ".join(prev_outcomes)
         print(f"  Recent outcomes: {outcomes_str}")
         model_up = conditional_prob_up(prev_outcomes)
         print(f"  Conditional P(Up): {model_up:.1%}")
@@ -181,6 +181,7 @@ def trade(
         print()
         return
 
+    nearest = tradeable[0]
     result = place_market_order(sig, nearest, bet_size)
     if result.success:
         print(f"  ORDER PLACED: {result.order_id}")

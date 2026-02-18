@@ -1,52 +1,30 @@
 """Fair-value model for 5-minute Bitcoin up/down markets.
 
-Core finding: OUTCOME MEAN-REVERSION is the primary edge.
+Core strategy: Outcome mean-reversion.
+48-hour analysis of 575 windows found strong auto-correlation:
+  - P(Up | prev Down) = 57.6%   → BUY UP
+  - P(Up | prev Up)   = 49.2%   → skip
+  - P(Up | prev 2xUp) = 44.3%   → skip
+  - P(Up | base)      = 53.2%   → marginal
 
-48-hour analysis (575 windows) showed:
-  - P(Up | prev Down) = 57.6% — strong signal, BUY UP
-  - P(Up | prev Up)   = 49.2% — no edge
-  - P(Up | prev 2x Up) = 44.3% — anti-predictive, SKIP
-  - Base rate: 53.2% Up (>= resolution rule)
-
-Strategy:
-  1. After a Down window → BUY UP (57.6% expected win rate)
-  2. After a single Up → BUY UP at reduced confidence (base rate only)
-  3. After 2+ consecutive Ups → SKIP (44.3% Up rate = negative edge)
-
-Also supports in-progress window evaluation for live markets
-where pricing has overreacted to early movement.
+BUY DOWN is catastrophically anti-predictive (25% win rate) and removed.
+Momentum at 5-min scale is near-random after look-ahead bias correction.
 """
 
 import math
-import time
 from dataclasses import dataclass
-
-from scipy.stats import norm
 
 from poly.btc import BTCSnapshot
 
+# --- Conditional probabilities from 48h analysis (575 windows) ---
+PROB_UP_AFTER_DOWN = 0.576  # P(Up | prev was Down)
+PROB_UP_AFTER_UP = 0.492  # P(Up | prev was Up)
+PROB_UP_AFTER_2X_UP = 0.443  # P(Up | prev 2 were Up)
+PROB_UP_BASE = 0.532  # unconditional base rate
 
-# --- Conditional probabilities from 48h analysis ---
-PROB_UP_AFTER_DOWN = 0.576    # P(Up | prev was Down)
-PROB_UP_AFTER_UP = 0.492      # P(Up | prev was Up)
-PROB_UP_AFTER_2X_UP = 0.443   # P(Up | prev 2 were Up)
-PROB_UP_BASE = 0.532          # unconditional base rate
-
-# --- In-progress parameters ---
-MARKET_TRUST_AT_START = 0.3
-MARKET_TRUST_AT_END = 0.95
-MEAN_REVERSION_STRENGTH = 0.20
-
-# --- Bounds ---
-PROB_FLOOR = 0.05
-PROB_CEIL = 0.95
-
-# --- Edge thresholds ---
-DEFAULT_EDGE_THRESHOLD = 0.03
-IN_PROGRESS_EDGE_THRESHOLD = 0.05
-
-# --- Kelly ---
-KELLY_FRACTION = 0.5  # half-Kelly
+# Edge thresholds
+DEFAULT_EDGE_THRESHOLD = 0.03  # 3% for pre-window
+IN_PROGRESS_EDGE_THRESHOLD = 0.05  # 5% for in-progress (market has info)
 
 
 @dataclass
@@ -74,20 +52,21 @@ class Signal:
     tradeable: bool
     in_progress: bool = False
     seconds_remaining: float = 0.0
-    prev_outcome: str = ""  # "Up", "Down", or "" if unknown
+    prev_outcome: str = ""  # most recent resolved outcome
 
 
-def conditional_prob_up(
-    prev_outcomes: list[str],
-) -> float:
-    """Calculate P(Up) based on previous window outcomes.
+def conditional_prob_up(prev_outcomes: list[str]) -> float:
+    """Calculate P(Up) conditioned on previous window outcomes.
 
-    This is the core model: mean-reversion in 5-min BTC outcomes.
+    The core edge: after a Down window, P(Up) is 57.6% due to
+    mean-reversion. After consecutive Ups, P(Up) drops to 44.3%.
 
     Args:
-        prev_outcomes: list of recent outcomes, most recent last.
-                       e.g. ["Up", "Down"] means second-to-last was Up,
-                       last was Down.
+        prev_outcomes: list of recent outcomes ["Up", "Down", ...],
+                      chronological order (oldest first).
+
+    Returns:
+        Conditional probability of Up for the next window.
     """
     if not prev_outcomes:
         return PROB_UP_BASE
@@ -95,7 +74,11 @@ def conditional_prob_up(
     last = prev_outcomes[-1]
 
     # Check for 2+ consecutive Ups
-    if len(prev_outcomes) >= 2 and prev_outcomes[-1] == "Up" and prev_outcomes[-2] == "Up":
+    if (
+        len(prev_outcomes) >= 2
+        and prev_outcomes[-1] == "Up"
+        and prev_outcomes[-2] == "Up"
+    ):
         return PROB_UP_AFTER_2X_UP
 
     if last == "Down":
@@ -107,45 +90,44 @@ def conditional_prob_up(
 
 
 def fair_prob_up_inprogress(
-    market_prob_up: float,
+    market_price: float,
     seconds_elapsed: float,
-    snapshot: BTCSnapshot | None = None,
+    prev_outcomes: list[str] | None = None,
 ) -> float:
-    """Calculate P(Up) for a window that's currently live.
+    """Fair P(Up) for an in-progress window.
 
-    Markets overreact to early price movement. Apply mean-reversion
-    that fades as the window nears resolution.
+    Markets show extreme skew during live windows (e.g. 6¢/94¢).
+    We blend market price with mean-reversion base rate, trusting
+    the market more as the window approaches resolution.
+
+    market_trust goes from 30% at start to 95% near end.
     """
-    window_seconds = 300.0
-    time_fraction = min(seconds_elapsed / window_seconds, 1.0)
+    total_window = 300.0  # 5 minutes
+    progress = min(seconds_elapsed / total_window, 1.0)
 
-    market_trust = MARKET_TRUST_AT_START + (
-        MARKET_TRUST_AT_END - MARKET_TRUST_AT_START
-    ) * time_fraction
+    # Market trust increases linearly
+    market_trust = 0.30 + 0.65 * progress
 
-    reversion_strength = MEAN_REVERSION_STRENGTH * (1 - time_fraction)
-    adjusted_market = market_prob_up + reversion_strength * (PROB_UP_BASE - market_prob_up)
+    # Base rate from conditional model
+    base = conditional_prob_up(prev_outcomes or [])
 
-    model_prob = market_trust * adjusted_market + (1 - market_trust) * PROB_UP_BASE
-
-    return max(PROB_FLOOR, min(PROB_CEIL, model_prob))
-
-
-# Backward compatibility
-def fair_prob_up(snapshot: BTCSnapshot, minutes_ahead: float = 0.0) -> float:
-    """Legacy function. Returns base rate probability."""
-    return PROB_UP_BASE
+    # Blend
+    fair = market_trust * market_price + (1.0 - market_trust) * base
+    return max(0.05, min(0.95, fair))
 
 
-def kelly_fraction_calc(prob: float, odds: float = 1.0) -> float:
-    """Half-Kelly bet fraction."""
+def kelly_fraction(prob: float, odds: float = 1.0) -> float:
+    """Calculate half-Kelly bet fraction.
+
+    f* = (p * (b + 1) - 1) / b  at half-Kelly.
+
+    For Polymarket at price ~0.505: b = 0.495/0.505 ≈ 0.98
+    So near even money.
+    """
     if prob <= 0.5:
         return 0.0
     f = (prob * (odds + 1) - 1) / odds
-    return max(0.0, f * KELLY_FRACTION)
-
-
-kelly_fraction = kelly_fraction_calc
+    return max(0.0, f * 0.5)  # half-Kelly
 
 
 def evaluate_5m_market(
@@ -154,33 +136,30 @@ def evaluate_5m_market(
     edge_threshold: float = DEFAULT_EDGE_THRESHOLD,
     prev_outcomes: list[str] | None = None,
 ) -> Signal:
-    """Evaluate a 5-minute market using the conditional mean-reversion model.
+    """Evaluate a single 5-minute market and produce a signal.
 
-    Args:
-        market: The market to evaluate.
-        snapshot: Current BTC state.
-        edge_threshold: Minimum edge to flag as actionable.
-        prev_outcomes: List of recent window outcomes ["Up", "Down", ...].
-                       Most recent last. Used for conditional probability.
+    Uses conditional mean-reversion model. BUY UP only.
     """
     is_live = market.is_in_progress
+    secs_remaining = market.seconds_until_end if is_live else 0.0
+
+    # Market price
     market_up = market.mid if market.mid > 0 else market.up_price
 
+    # Model probability
     if is_live:
+        secs_elapsed = market.seconds_elapsed
         model_up = fair_prob_up_inprogress(
-            market_prob_up=market_up,
-            seconds_elapsed=market.seconds_elapsed,
-            snapshot=snapshot,
+            market_up, secs_elapsed, prev_outcomes
         )
-        threshold = max(edge_threshold, IN_PROGRESS_EDGE_THRESHOLD)
+        threshold = IN_PROGRESS_EDGE_THRESHOLD
     else:
-        # Conditional model: use previous outcomes
         model_up = conditional_prob_up(prev_outcomes or [])
         threshold = edge_threshold
 
     edge = model_up - market_up
 
-    # BUY UP only. Skip after 2+ consecutive Ups (negative edge).
+    # BUY UP only — BUY DOWN is anti-predictive (25% win rate)
     if edge > threshold:
         side = "BUY UP"
         win_prob = model_up
@@ -195,7 +174,7 @@ def evaluate_5m_market(
     # Kelly sizing
     if buy_price > 0 and buy_price < 1 and side != "NO EDGE":
         net_odds = (1.0 - buy_price) / buy_price
-        kf = kelly_fraction_calc(win_prob, net_odds)
+        kf = kelly_fraction(win_prob, net_odds)
     else:
         kf = 0.0
 
@@ -222,6 +201,6 @@ def evaluate_5m_market(
         liquidity=market.liquidity,
         tradeable=market.is_tradeable,
         in_progress=is_live,
-        seconds_remaining=market.seconds_until_end if is_live else 0,
+        seconds_remaining=secs_remaining,
         prev_outcome=prev_str,
     )

@@ -26,9 +26,9 @@ class BacktestTrade:
     edge: float
     pnl: float  # dollar P&L for this trade
     won: bool
-    bet_size: float = 0.0  # actual dollar bet
-    bankroll_after: float = 0.0  # bankroll after this trade
-    kelly_frac: float = 0.0  # Kelly fraction used
+    bet_size: float = 0.0
+    bankroll_after: float = 0.0
+    kelly_frac: float = 0.0
 
 
 @dataclass
@@ -37,21 +37,21 @@ class BacktestResult:
 
     trades: list[BacktestTrade]
     total_windows: int
-    tradeable_windows: int  # windows where model had an edge
+    tradeable_windows: int
     wins: int
     losses: int
     win_rate: float
-    total_pnl: float  # total dollar P&L
+    total_pnl: float
     avg_edge: float
     avg_model_prob_up: float
     up_count: int
     down_count: int
-    base_rate_up: float  # actual % of windows that went Up
+    base_rate_up: float
     starting_bankroll: float = 0.0
     ending_bankroll: float = 0.0
     peak_bankroll: float = 0.0
-    max_drawdown: float = 0.0  # max % drawdown from peak
-    roi: float = 0.0  # total return on starting bankroll
+    max_drawdown: float = 0.0
+    roi: float = 0.0
     bankroll_history: list[float] = field(default_factory=list)
 
 
@@ -65,11 +65,10 @@ def run_backtest(
     """Run a backtest over the last N hours of resolved 5-minute markets.
 
     For each resolved window:
-    1. Reconstruct BTCSnapshot from 1-min candles at that time
-    2. Compute model P(Up)
-    3. Compare to actual outcome
-    4. Size bet via Kelly criterion on current bankroll
-    5. Track bankroll evolution
+    1. Compute conditional P(Up) based on previous outcomes
+    2. Compare to assumed market price (~0.505)
+    3. Size bet via Kelly criterion on current bankroll
+    4. Track bankroll evolution
     """
     from poly.model import conditional_prob_up, kelly_fraction as calc_kelly
 
@@ -263,21 +262,15 @@ def print_backtest(result: BacktestResult) -> None:
     if len(result.bankroll_history) > 2:
         _print_bankroll_chart(result.bankroll_history, result.starting_bankroll)
 
-    # Show trade breakdown by side
+    # Show trade breakdown
     actionable = [t for t in result.trades if t.model_side != "NO EDGE"]
     if actionable:
         up_trades = [t for t in actionable if t.model_side == "BUY UP"]
-        down_trades = [t for t in actionable if t.model_side == "BUY DOWN"]
         up_wins = sum(1 for t in up_trades if t.won)
-        down_wins = sum(1 for t in down_trades if t.won)
         up_pnl = sum(t.pnl for t in up_trades)
-        down_pnl = sum(t.pnl for t in down_trades)
-
         print(f"\n  --- BY SIDE ---")
         if up_trades:
             print(f"  BUY UP:   {up_wins}/{len(up_trades)} wins ({up_wins/len(up_trades):.0%})  P&L: {'+' if up_pnl >= 0 else ''}${up_pnl:,.2f}")
-        if down_trades:
-            print(f"  BUY DOWN: {down_wins}/{len(down_trades)} wins ({down_wins/len(down_trades):.0%})  P&L: {'+' if down_pnl >= 0 else ''}${down_pnl:,.2f}")
 
     # Show recent trades
     if actionable:
