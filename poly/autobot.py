@@ -36,6 +36,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -293,9 +294,9 @@ def _try_start_market_stream(token_id: str, condition_id: str | None = None):
 
 
 def _print(msg: str) -> None:
-    """Print with timestamp."""
+    """Print with timestamp. Always flushes for systemd/pipe compatibility."""
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"  [{ts}] {msg}")
+    print(f"  [{ts}] {msg}", flush=True)
 
 
 def run_bot(
@@ -349,29 +350,28 @@ def run_bot(
         place_order_fn = place_maker_order if use_maker else place_market_order
         sell_fn = sell_shares
 
-    # Handle graceful shutdown
-    shutdown = False
+    # Handle graceful shutdown — uses Event so sleeps can be interrupted
+    shutdown_event = threading.Event()
 
     def _shutdown(sig, frame):
-        nonlocal shutdown
-        shutdown = True
+        shutdown_event.set()
         _print("Shutting down gracefully...")
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
     # Print banner
-    print()
-    print("=" * 72)
-    print(f"  POLY AUTOBOT ({mode}) — {order_type}")
-    print(f"  Bankroll: ${state.bankroll:,.2f}  |  Kelly: {kelly_mult:.0%}  |  Edge: {edge_threshold:.0%}{stoploss_str}")
+    print(flush=True)
+    print("=" * 72, flush=True)
+    print(f"  POLY AUTOBOT ({mode}) — {order_type}", flush=True)
+    print(f"  Bankroll: ${state.bankroll:,.2f}  |  Kelly: {kelly_mult:.0%}  |  Edge: {edge_threshold:.0%}{stoploss_str}", flush=True)
     if _tg_configured():
-        print(f"  Telegram: ON")
-    print(f"  Started: {state.started_at}")
+        print(f"  Telegram: ON", flush=True)
+    print(f"  Started: {state.started_at}", flush=True)
     if state.total_trades > 0:
-        print(f"  Trades: {state.total_trades}  |  WR: {state.win_rate:.1%}  |  P&L: ${state.total_pnl:+,.2f}")
-    print("=" * 72)
-    print()
+        print(f"  Trades: {state.total_trades}  |  WR: {state.win_rate:.1%}  |  P&L: ${state.total_pnl:+,.2f}", flush=True)
+    print("=" * 72, flush=True)
+    print(flush=True)
 
     # Notify startup
     notify_startup(mode, order_type, state.bankroll, kelly_mult, edge_threshold, enable_stoploss)
@@ -389,11 +389,12 @@ def run_bot(
     last_daily_summary = 0
 
     # Main loop
-    while not shutdown:
+    while not shutdown_event.is_set():
         try:
             _run_one_cycle(
                 state, edge_threshold, max_bet_pct, kelly_mult,
                 place_order_fn, sell_fn, use_maker, enable_stoploss,
+                shutdown_event,
             )
             state.save()
 
@@ -408,18 +409,18 @@ def run_bot(
         except Exception as e:
             _print(f"ERROR: {e}")
             notify_error(str(e))
-            time.sleep(30)  # back off on errors
+            shutdown_event.wait(30)  # back off on errors (interruptible)
 
     # Final save
     state.save()
     notify_shutdown(state.bankroll, state.total_trades, state.win_rate, state.total_pnl, state.max_drawdown)
-    print()
-    print("=" * 72)
-    print(f"  BOT STOPPED — {_now_utc()}")
-    print(f"  Bankroll: ${state.bankroll:,.2f}  |  Trades: {state.total_trades}  |  WR: {state.win_rate:.1%}")
-    print(f"  P&L: ${state.total_pnl:+,.2f}  |  Max DD: {state.max_drawdown:.1%}  |  Stopouts: {state.total_stopouts}")
-    print("=" * 72)
-    print()
+    print(flush=True)
+    print("=" * 72, flush=True)
+    print(f"  BOT STOPPED — {_now_utc()}", flush=True)
+    print(f"  Bankroll: ${state.bankroll:,.2f}  |  Trades: {state.total_trades}  |  WR: {state.win_rate:.1%}", flush=True)
+    print(f"  P&L: ${state.total_pnl:+,.2f}  |  Max DD: {state.max_drawdown:.1%}  |  Stopouts: {state.total_stopouts}", flush=True)
+    print("=" * 72, flush=True)
+    print(flush=True)
 
 
 def _run_one_cycle(
@@ -431,6 +432,7 @@ def _run_one_cycle(
     sell_fn,
     use_maker: bool,
     enable_stoploss: bool,
+    shutdown_event: threading.Event | None = None,
 ) -> None:
     """Run a single trade cycle: wait → book → evaluate → trade → verify → monitor → resolve."""
 
@@ -450,7 +452,10 @@ def _run_one_cycle(
         wait_secs = target_time - now
         _print(f"Next window: {next_dt.strftime('%H:%M:%S UTC')}  (waiting {wait_secs:.0f}s)")
         while time.time() < target_time:
-            time.sleep(min(5.0, target_time - time.time()))
+            if shutdown_event and shutdown_event.wait(min(5.0, max(0, target_time - time.time()))):
+                return  # Exit immediately on shutdown
+            elif not shutdown_event:
+                time.sleep(min(5.0, max(0, target_time - time.time())))
 
     # Fetch market for token IDs and live book
     market = _fetch_5m_market(next_ts)
