@@ -376,7 +376,12 @@ ssh root@YOUR_SERVER 'systemctl start poly-bot'
 | `poly-bot` | Autobot (maker, dry-run by default) | — |
 | `poly-dashboard` | Web dashboard | 8080 |
 
-**Logs**: `/var/log/poly/bot.log`, `/var/log/poly/dashboard.log`, or `journalctl -u poly-bot -f`
+**Logs**: stdout is redirected to files, NOT journalctl. Use `tail -f` to follow:
+- Bot: `tail -f /var/log/poly/bot.log`
+- Dashboard: `tail -f /var/log/poly/dashboard.log`
+- `journalctl -u poly-bot` only shows systemd lifecycle messages (Started/Stopped), not Python output.
+
+**Important**: Both service files set `Environment=PYTHONUNBUFFERED=1` so Python output flushes immediately to the log files. Without this, Python buffers stdout and the log files appear empty.
 
 **To switch to live trading**: Edit `/etc/systemd/system/poly-bot.service`, change `ExecStart` to include `--live`, then `systemctl daemon-reload && systemctl restart poly-bot`.
 
@@ -392,6 +397,7 @@ ssh root@YOUR_SERVER 'systemctl start poly-bot'
 - **Quarter-Kelly** is the sizing sweet spot: 0% ruin risk at $500+ bankroll.
 - **Fees are significant but survivable**: 1.56% taker fee eats ~50% of EV. Maker eliminates it.
 - **Resolution source is Chainlink**, not exchange spot prices.
+- **Autobot saves state immediately on startup** (including `--fresh`), so the dashboard shows correct bankroll before the first trade completes.
 - **Autobot waits for every window** even when not trading, to keep outcome sequence current.
 - **Backtest honesty**: `--fill-rate` simulates partial maker fills, `--real-prices` uses actual historical CLOB prices instead of assumed constants.
 - **Telegram notifications** are non-blocking (background threads) and gracefully degrade if not configured. The bot runs identically with or without Telegram.
