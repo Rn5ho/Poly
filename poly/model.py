@@ -1,14 +1,18 @@
 """Fair-value model for 5-minute Bitcoin up/down markets.
 
-Core strategy: Outcome mean-reversion.
-48-hour analysis of 575 windows found strong auto-correlation:
-  - P(Up | prev Down) = 57.6%   → BUY UP
-  - P(Up | prev Up)   = 49.2%   → skip
-  - P(Up | prev 2xUp) = 44.3%   → skip
-  - P(Up | base)      = 53.2%   → marginal
+Core strategy: Outcome mean-reversion (BUY UP after Down outcomes).
 
-BUY DOWN is catastrophically anti-predictive (25% win rate) and removed.
-Momentum at 5-min scale is near-random after look-ahead bias correction.
+Calibrated on 1,823 resolved windows (6 days, Feb 12-18 2026):
+  - P(Up | prev Down)       = 56.0%  (n=863, CI: 52.6-59.2%)  → BUY UP
+  - P(Up | prev 2x Down)    = 57.6%  (n=380, CI: 52.6-62.5%)  → BUY UP (stronger)
+  - P(Up | prev 3x Down)    = 59.0%  (n=161, CI: 51.3-66.3%)  → BUY UP (strongest)
+  - P(Up | prev Up)          = 49.5%  (n=959)  → skip
+  - P(Up | prev 2x Up)       = 47.4%  (n=475)  → skip
+  - Base rate (Up):           52.6%
+
+BUY DOWN signals do not survive 95% CI testing (CI includes 50.5%).
+Position sizing: quarter-Kelly (aggressive enough to compound,
+conservative enough for 0% ruin at $500+ bankroll over 863 trades).
 """
 
 import math
@@ -16,15 +20,23 @@ from dataclasses import dataclass
 
 from poly.btc import BTCSnapshot
 
-# --- Conditional probabilities from 48h analysis (575 windows) ---
-PROB_UP_AFTER_DOWN = 0.576  # P(Up | prev was Down)
-PROB_UP_AFTER_UP = 0.492  # P(Up | prev was Up)
-PROB_UP_AFTER_2X_UP = 0.443  # P(Up | prev 2 were Up)
-PROB_UP_BASE = 0.532  # unconditional base rate
+# --- Conditional probabilities from 6-day analysis (1,823 windows) ---
+# Graduated: deeper Down streaks → stronger signal
+PROB_UP_AFTER_DOWN = 0.560  # P(Up | prev was Down), n=863
+PROB_UP_AFTER_2X_DOWN = 0.576  # P(Up | prev 2 were Down), n=380
+PROB_UP_AFTER_3X_DOWN = 0.590  # P(Up | prev 3+ were Down), n=161
+PROB_UP_AFTER_UP = 0.495  # P(Up | prev was Up), n=959
+PROB_UP_AFTER_2X_UP = 0.474  # P(Up | prev 2 were Up), n=475
+PROB_UP_BASE = 0.526  # unconditional base rate
 
 # Edge thresholds
 DEFAULT_EDGE_THRESHOLD = 0.03  # 3% for pre-window
 IN_PROGRESS_EDGE_THRESHOLD = 0.05  # 5% for in-progress (market has info)
+
+# Position sizing
+KELLY_MULTIPLIER = 0.25  # quarter-Kelly (0% ruin risk at $500+)
+MAX_BET_PCT = 0.10  # never bet more than 10% of bankroll
+MIN_BET = 5.0  # Polymarket minimum
 
 
 @dataclass
@@ -58,8 +70,8 @@ class Signal:
 def conditional_prob_up(prev_outcomes: list[str]) -> float:
     """Calculate P(Up) conditioned on previous window outcomes.
 
-    The core edge: after a Down window, P(Up) is 57.6% due to
-    mean-reversion. After consecutive Ups, P(Up) drops to 44.3%.
+    Uses graduated conditional probabilities: deeper Down streaks
+    produce stronger BUY UP signals (mean-reversion intensifies).
 
     Args:
         prev_outcomes: list of recent outcomes ["Up", "Down", ...],
@@ -73,20 +85,34 @@ def conditional_prob_up(prev_outcomes: list[str]) -> float:
 
     last = prev_outcomes[-1]
 
-    # Check for 2+ consecutive Ups
-    if (
-        len(prev_outcomes) >= 2
-        and prev_outcomes[-1] == "Up"
-        and prev_outcomes[-2] == "Up"
-    ):
-        return PROB_UP_AFTER_2X_UP
-
+    # Count consecutive Downs from the end
     if last == "Down":
-        return PROB_UP_AFTER_DOWN
-    elif last == "Up":
+        down_streak = 0
+        for o in reversed(prev_outcomes):
+            if o == "Down":
+                down_streak += 1
+            else:
+                break
+        if down_streak >= 3:
+            return PROB_UP_AFTER_3X_DOWN
+        elif down_streak >= 2:
+            return PROB_UP_AFTER_2X_DOWN
+        else:
+            return PROB_UP_AFTER_DOWN
+
+    # Count consecutive Ups from the end
+    if last == "Up":
+        up_streak = 0
+        for o in reversed(prev_outcomes):
+            if o == "Up":
+                up_streak += 1
+            else:
+                break
+        if up_streak >= 2:
+            return PROB_UP_AFTER_2X_UP
         return PROB_UP_AFTER_UP
-    else:
-        return PROB_UP_BASE
+
+    return PROB_UP_BASE
 
 
 def fair_prob_up_inprogress(
@@ -116,18 +142,18 @@ def fair_prob_up_inprogress(
     return max(0.05, min(0.95, fair))
 
 
-def kelly_fraction(prob: float, odds: float = 1.0) -> float:
-    """Calculate half-Kelly bet fraction.
+def kelly_fraction(prob: float, odds: float = 1.0, multiplier: float = KELLY_MULTIPLIER) -> float:
+    """Calculate fractional Kelly bet fraction.
 
-    f* = (p * (b + 1) - 1) / b  at half-Kelly.
+    f* = (p * (b + 1) - 1) / b  at quarter-Kelly (default).
 
-    For Polymarket at price ~0.505: b = 0.495/0.505 ≈ 0.98
-    So near even money.
+    Quarter-Kelly gives 0% ruin risk at $500+ bankroll over 863 trades
+    with 39.8% max drawdown (vs 66.2% at half-Kelly).
     """
     if prob <= 0.5:
         return 0.0
     f = (prob * (odds + 1) - 1) / odds
-    return max(0.0, f * 0.5)  # half-Kelly
+    return max(0.0, f * multiplier)
 
 
 def evaluate_5m_market(

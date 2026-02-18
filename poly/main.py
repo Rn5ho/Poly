@@ -6,6 +6,7 @@ Modes:
   watch     Continuous scanning with live signals
   backtest  Validate model against resolved markets
   trade     Live trading (requires POLY_PRIVATE_KEY)
+  autobot   Automated continuous trading bot
 """
 
 import argparse
@@ -270,6 +271,15 @@ def main():
     p_trade.add_argument("-m", "--max-bet", type=float, default=50.0)
     p_trade.add_argument("--live", action="store_true", help="Actually place orders (default: dry run)")
 
+    # autobot
+    p_auto = sub.add_parser("autobot", help="Automated continuous trading bot")
+    p_auto.add_argument("-b", "--bankroll", type=float, default=500.0, help="Starting bankroll (default $500)")
+    p_auto.add_argument("-e", "--edge", type=float, default=0.03, help="Edge threshold (default 0.03)")
+    p_auto.add_argument("-k", "--kelly", type=float, default=0.25, help="Kelly multiplier (default 0.25 = quarter)")
+    p_auto.add_argument("--max-bet-pct", type=float, default=0.10, help="Max bet as %% of bankroll")
+    p_auto.add_argument("--live", action="store_true", help="Place real orders (default: dry run)")
+    p_auto.add_argument("--fresh", action="store_true", help="Start fresh (ignore saved state)")
+
     args = parser.parse_args()
 
     try:
@@ -290,6 +300,17 @@ def main():
                 bankroll=args.bankroll,
                 max_bet=args.max_bet,
                 dry_run=not args.live,
+            )
+        elif args.command == "autobot":
+            from poly.autobot import run_bot
+
+            run_bot(
+                bankroll=args.bankroll,
+                edge_threshold=args.edge,
+                max_bet_pct=args.max_bet_pct,
+                kelly_mult=args.kelly,
+                dry_run=not args.live,
+                resume=not args.fresh,
             )
         else:
             # Default: scan
