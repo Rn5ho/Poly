@@ -7,6 +7,7 @@ Supports:
   - Maker (post-only) limit orders — $0 fee, eligible for 20% rebate
   - Taker (FOK) market orders — 1.56% fee at p=0.50
   - Sell orders — for cash-out / stop-loss during live windows
+  - Fill verification — poll order status to confirm maker fills
 
 Setup:
   pip install py-clob-client
@@ -15,6 +16,7 @@ Setup:
 """
 
 import os
+import time
 from dataclasses import dataclass
 
 from poly.model import Signal
@@ -34,6 +36,43 @@ class TradeResult:
     price: float
     size: float
     error: str | None
+
+
+@dataclass
+class OrderStatus:
+    """Status of a resting order from the CLOB.
+
+    Fields from GET /data/order/<order_hash>:
+      - size_matched: shares filled so far
+      - original_size: total shares requested
+      - status: CLOB order status string
+    """
+
+    order_id: str
+    status: str  # e.g. "live", "matched", "canceled"
+    size_matched: float
+    original_size: float
+    price: float
+    side: str
+    asset_id: str
+
+    @property
+    def fill_fraction(self) -> float:
+        if self.original_size <= 0:
+            return 0.0
+        return self.size_matched / self.original_size
+
+    @property
+    def is_fully_filled(self) -> bool:
+        return self.size_matched >= self.original_size * 0.99  # 1% tolerance
+
+    @property
+    def is_live(self) -> bool:
+        return self.status.lower() in ("live", "open")
+
+    @property
+    def unfilled_size(self) -> float:
+        return max(0.0, self.original_size - self.size_matched)
 
 
 def _get_client():
@@ -303,6 +342,101 @@ def cancel_all_orders() -> bool:
         return True
     except Exception:
         return False
+
+
+def get_order_status(order_id: str) -> OrderStatus | None:
+    """Fetch current status of an order including fill progress.
+
+    Uses GET /data/order/<order_hash> which returns:
+      - size_matched: how many shares have been filled
+      - original_size: total shares requested
+      - status: order state (live, matched, canceled, etc.)
+    """
+    client = _get_client()
+    try:
+        order = client.get_order(order_id)
+        return OrderStatus(
+            order_id=order_id,
+            status=str(order.get("status", "unknown")),
+            size_matched=float(order.get("size_matched", 0)),
+            original_size=float(order.get("original_size", 0)),
+            price=float(order.get("price", 0)),
+            side=str(order.get("side", "")),
+            asset_id=str(order.get("asset_id", "")),
+        )
+    except Exception:
+        return None
+
+
+def wait_for_fill(
+    order_id: str,
+    timeout: float = 30.0,
+    poll_interval: float = 2.0,
+    cancel_on_timeout: bool = True,
+) -> OrderStatus | None:
+    """Poll an order until it fills, times out, or is canceled.
+
+    Args:
+        order_id: The order ID returned from place_maker_order.
+        timeout: Max seconds to wait for fill.
+        poll_interval: Seconds between status checks.
+        cancel_on_timeout: If True, cancel the order when timeout is reached.
+
+    Returns:
+        Final OrderStatus, or None if order couldn't be fetched.
+        Check .is_fully_filled and .size_matched on the result.
+    """
+    deadline = time.time() + timeout
+    last_status = None
+
+    while time.time() < deadline:
+        status = get_order_status(order_id)
+        if status is None:
+            time.sleep(poll_interval)
+            continue
+
+        last_status = status
+
+        # Fully filled
+        if status.is_fully_filled:
+            return status
+
+        # Order was canceled or rejected externally
+        if status.status.lower() in ("canceled", "cancelled", "rejected"):
+            return status
+
+        time.sleep(poll_interval)
+
+    # Timeout reached — cancel unfilled portion if requested
+    if cancel_on_timeout and last_status and last_status.is_live:
+        cancel_order(order_id)
+        # Re-fetch to get final state after cancellation
+        final = get_order_status(order_id)
+        if final:
+            return final
+
+    return last_status
+
+
+def get_trades_for_market(
+    market_id: str,
+    after_ts: int | None = None,
+) -> list[dict]:
+    """Fetch executed trades for a market, optionally after a timestamp.
+
+    Uses GET /data/trades?market=<condition_id>&after=<ts>.
+    Useful for post-trade audit trail — confirms actual fills with
+    prices, sizes, and fee rates.
+    """
+    client = _get_client()
+    try:
+        params = {"market": market_id}
+        if after_ts:
+            params["after"] = after_ts
+        trades = client.get_trades(params)
+        return trades if isinstance(trades, list) else []
+    except Exception:
+        return []
 
 
 def calculate_bet_size(

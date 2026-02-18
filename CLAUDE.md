@@ -7,16 +7,17 @@ Polymarket 5-minute BTC up/down trading system. Uses outcome mean-reversion (BUY
 ```
 Poly/
 ├── CLAUDE.md              # This file
-├── requirements.txt       # Python deps: requests, scipy, numpy
+├── requirements.txt       # Python deps: requests, scipy, numpy, websockets
 └── poly/                  # Main package
     ├── __init__.py
     ├── main.py            # CLI entry point — scan, watch, backtest, trade, autobot modes
     ├── btc.py             # BTC price, 1-min momentum, realized volatility (Kraken/CoinGecko)
-    ├── polymarket.py      # 5-min market discovery via timestamp-based slug probing + CLOB book
+    ├── polymarket.py      # 5-min market discovery, CLOB book, live prices, price history
     ├── model.py           # Conditional mean-reversion model: P(Up|prev outcomes), Kelly sizing, fees
-    ├── backtest.py        # Backtesting engine: reconstruct snapshots, validate vs outcomes
-    ├── execute.py         # Order execution: maker/taker buys, sell (cash-out/stop-loss), cancel
-    └── autobot.py         # Automated continuous trading bot with maker orders + stop-loss
+    ├── backtest.py        # Backtesting engine: real prices, fill-rate simulation
+    ├── execute.py         # Order execution: maker/taker, fill verification, sell, cancel
+    ├── autobot.py         # Automated bot: live book, fill verification, WS stop-loss
+    └── ws.py              # WebSocket client: market price streaming, user fill events
 ```
 
 ## How It Works
@@ -53,6 +54,8 @@ python -m poly.main backtest                       # Last 6 hours, as taker
 python -m poly.main backtest --maker               # As maker ($0 fee)
 python -m poly.main backtest -H 152 -b 500         # Full history since launch
 python -m poly.main backtest -H 152 -b 500 --maker # Full history, maker pricing
+python -m poly.main backtest --maker --fill-rate 0.5   # 50% maker fill rate
+python -m poly.main backtest --maker --real-prices     # Use actual CLOB prices
 
 # Trade — single-shot trading
 python -m poly.main trade                          # Dry run
@@ -211,12 +214,14 @@ Quarter-Kelly criterion (0.25x full Kelly) with **fee-adjusted odds**:
 `autobot.py` runs a continuous loop:
 
 1. **Wait** for next 5-minute window (places orders 30s before start)
-2. **Evaluate** conditional P(Up) from recent outcome sequence
-3. **Size** bet via quarter-Kelly if edge > threshold
-4. **Execute** maker limit buy at $0.50 (or taker FOK at $0.51)
-5. **Monitor** (optional) live window for stop-loss trigger
-6. **Resolve** — poll Gamma API for outcome, update bankroll
-7. **Persist** state to `poly_bot_state.json` after every cycle
+2. **Book** — fetch live order book for real bid/ask prices
+3. **Evaluate** conditional P(Up) from recent outcome sequence
+4. **Size** bet via quarter-Kelly if edge > threshold (using live prices)
+5. **Execute** maker limit buy at live bid (or taker FOK at live ask)
+6. **Verify** — poll order status for fill confirmation, cancel unfilled on timeout
+7. **Monitor** (optional) WebSocket-based stop-loss during live window (REST fallback)
+8. **Resolve** — poll Gamma API for outcome, update bankroll using actual fill size
+9. **Persist** state to `poly_bot_state.json` after every cycle
 
 **New flags**:
 - `--maker` (default) — use post-only limit orders at bid ($0 fee, 2x EV)
@@ -247,6 +252,11 @@ export POLY_FUNDER="0x..."           # Optional: proxy wallet address
 - `sell_shares(token_id, size, price, as_maker)` — Sell for cash-out / stop-loss
 - `cancel_order(order_id)` — Cancel a resting order
 - `cancel_all_orders()` — Cancel all resting orders
+
+**Fill Verification** (new):
+- `get_order_status(order_id)` → `OrderStatus` with `size_matched`, `original_size`, `fill_fraction`
+- `wait_for_fill(order_id, timeout, poll_interval, cancel_on_timeout)` → polls until filled or timeout
+- `get_trades_for_market(market_id, after_ts)` → executed trade audit trail
 
 ## External APIs
 
@@ -284,9 +294,12 @@ Also available (not yet implemented):
 - **Outcome mean-reversion** is the core insight: After Down windows, Up probability increases. Deeper Down streaks → stronger signal.
 - **BUY DOWN is dead**: No bearish conditional pattern survives 95% CI testing.
 - **Maker orders are the #1 profitability lever**: $0 fee + 1c better price = 2x EV vs taker. Default mode.
+- **Fill verification is critical**: Maker orders queue behind existing liquidity. The bot polls `GET /data/order/<id>` to confirm `size_matched` before counting a trade. Unfilled orders are canceled before window start.
+- **Live book prices** replace hardcoded bid/ask. The bot fetches the CLOB order book before every trade to use real bid/ask for edge calculation and sizing.
 - **Cash-out (sell early)** is the #2 lever: Stop-loss at 30c limits losing trades from -100% to ~-40%.
+- **WebSocket stop-loss** uses the market channel for sub-second price updates (falls back to REST polling if unavailable).
 - **Quarter-Kelly** is the sizing sweet spot: 0% ruin risk at $500+ bankroll.
 - **Fees are significant but survivable**: 1.56% taker fee eats ~50% of EV. Maker eliminates it.
 - **Resolution source is Chainlink**, not exchange spot prices.
 - **Autobot waits for every window** even when not trading, to keep outcome sequence current.
-- **CLOB order book** has decent liquidity (~930 shares at bid, 200+ per ask level).
+- **Backtest honesty**: `--fill-rate` simulates partial maker fills, `--real-prices` uses actual historical CLOB prices instead of assumed constants.

@@ -2,8 +2,14 @@
 
 Uses the outcome mean-reversion strategy: P(Up) depends on previous
 window outcomes, not momentum. Validates against resolved markets.
+
+Supports:
+  - Real market prices via CLOB price history API (--real-prices)
+  - Fill rate simulation for maker orders (--fill-rate 0.5)
+  - Standard assumed-price mode for fast iteration
 """
 
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -22,13 +28,14 @@ class BacktestTrade:
     actual_outcome: str  # "Up" or "Down"
     model_prob_up: float
     model_side: str  # "BUY UP" or "NO EDGE"
-    market_prob_up: float  # what market was pricing (always ~0.50)
+    market_prob_up: float  # what market was pricing
     edge: float
     pnl: float  # dollar P&L for this trade
     won: bool
     bet_size: float = 0.0
     bankroll_after: float = 0.0
     kelly_frac: float = 0.0
+    filled: bool = True  # False if simulated fill miss
 
 
 @dataclass
@@ -53,6 +60,57 @@ class BacktestResult:
     max_drawdown: float = 0.0
     roi: float = 0.0
     bankroll_history: list[float] = field(default_factory=list)
+    fill_rate_used: float = 1.0  # fill rate param used
+    fills_missed: int = 0  # trades skipped due to fill miss
+
+
+def _fetch_historical_prices(token_ids: dict[int, str], workers: int = 10) -> dict[int, float]:
+    """Fetch historical midpoint prices for windows around their start time.
+
+    Args:
+        token_ids: mapping of window_ts -> up_token_id
+        workers: thread pool size
+
+    Returns:
+        mapping of window_ts -> midpoint price at window start
+    """
+    from poly.polymarket import fetch_price_history
+
+    prices = {}
+
+    def _fetch_one(ts: int, token_id: str) -> tuple[int, float | None]:
+        history = fetch_price_history(token_id, start_ts=ts - 60, end_ts=ts + 30, fidelity=1)
+        if history:
+            # Use the price closest to window start
+            closest = min(history, key=lambda h: abs(h["t"] - ts))
+            return (ts, float(closest["p"]))
+        return (ts, None)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_one, ts, tid): ts for ts, tid in token_ids.items()}
+        for future in as_completed(futures):
+            ts, price = future.result()
+            if price and price > 0:
+                prices[ts] = price
+
+    return prices
+
+
+def _fetch_token_ids(timestamps: list[int], workers: int = 20) -> dict[int, str]:
+    """Fetch Up token IDs for a list of window timestamps."""
+    from poly.polymarket import _fetch_5m_market
+
+    token_ids = {}
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_5m_market, ts): ts for ts in timestamps}
+        for future in as_completed(futures):
+            ts = futures[future]
+            market = future.result()
+            if market and market.up_token_id:
+                token_ids[ts] = market.up_token_id
+
+    return token_ids
 
 
 def run_backtest(
@@ -62,14 +120,31 @@ def run_backtest(
     max_bet: float = 0.0,  # 0 = auto (10% of bankroll)
     workers: int = 20,
     as_maker: bool = False,
+    fill_rate: float = 1.0,
+    use_real_prices: bool = False,
 ) -> BacktestResult:
     """Run a backtest over the last N hours of resolved 5-minute markets.
 
     For each resolved window:
     1. Compute conditional P(Up) based on previous outcomes
-    2. Compare to assumed market price (~0.505)
-    3. Size bet via Kelly criterion on current bankroll
-    4. Track bankroll evolution
+    2. Use real market price (if available) or assumed price
+    3. Simulate fill probability for maker orders
+    4. Size bet via Kelly criterion on current bankroll
+    5. Track bankroll evolution
+
+    Args:
+        hours: How many hours of history to test.
+        edge_threshold: Minimum edge to trade.
+        bankroll: Starting bankroll in USD.
+        max_bet: Max bet per trade (0 = 10% of bankroll).
+        workers: Thread pool size for API fetches.
+        as_maker: Simulate as maker ($0 fee, bid price).
+        fill_rate: Simulated fill probability for maker orders (0.0-1.0).
+                   At 1.0 (default), all orders fill. At 0.5, half are missed.
+                   Only applies when as_maker=True.
+        use_real_prices: If True, fetch actual historical market prices
+                        from CLOB price history API instead of using
+                        hardcoded bid/ask assumptions.
     """
     from poly.model import conditional_prob_up, kelly_fraction as calc_kelly, net_odds_after_fees, DEFAULT_BUY_PRICE, MAKER_BUY_PRICE
 
@@ -78,6 +153,7 @@ def run_backtest(
     peak_bankroll = bankroll
     max_drawdown = 0.0
     bankroll_history = [bankroll]
+    fills_missed = 0
 
     # Generate timestamps for all 5-min windows in the backtest period
     now = int(time.time())
@@ -112,6 +188,18 @@ def run_backtest(
 
     print(f"  Got {len(outcomes)} resolved outcomes")
 
+    # Fetch real market prices if requested
+    real_prices: dict[int, float] = {}
+    if use_real_prices:
+        sorted_resolved = sorted(outcomes.keys())
+        print(f"  Fetching token IDs for {len(sorted_resolved)} resolved windows...")
+        token_ids = _fetch_token_ids(sorted_resolved, workers=workers)
+        print(f"    Got {len(token_ids)} token IDs")
+        if token_ids:
+            print(f"  Fetching historical prices...")
+            real_prices = _fetch_historical_prices(token_ids, workers=workers)
+            print(f"    Got {len(real_prices)} historical prices")
+
     # Build ordered sequence of resolved outcomes for conditional model
     sorted_ts = sorted(outcomes.keys())
     recent_outcomes: list[str] = []  # rolling window of recent outcomes
@@ -130,10 +218,18 @@ def run_backtest(
         # Conditional model: P(Up) based on previous outcomes
         model_up = conditional_prob_up(recent_outcomes)
 
-        # Market pricing: taker buys at ask (~0.510), maker at bid (~0.500)
-        buy_price = MAKER_BUY_PRICE if as_maker else DEFAULT_BUY_PRICE
-        market_up = buy_price
-        edge = model_up - market_up
+        # Market pricing: use real price if available, else assumed
+        if ts in real_prices:
+            market_up = real_prices[ts]
+            # For maker, buy at bid (real_price is ~midpoint, bid is slightly lower)
+            if as_maker:
+                buy_price = max(market_up - 0.01, 0.01)  # bid ~1c below mid
+            else:
+                buy_price = min(market_up + 0.01, 0.99)  # ask ~1c above mid
+        else:
+            buy_price = MAKER_BUY_PRICE if as_maker else DEFAULT_BUY_PRICE
+            market_up = buy_price
+        edge = model_up - buy_price
 
         # BUY UP only when we have positive edge
         if edge > edge_threshold:
@@ -151,11 +247,18 @@ def run_backtest(
         if len(recent_outcomes) > 5:
             recent_outcomes.pop(0)
 
+        # Simulate fill probability for maker orders
+        filled = True
+        if side != "NO EDGE" and as_maker and fill_rate < 1.0:
+            if random.random() > fill_rate:
+                filled = False
+                fills_missed += 1
+
         # Kelly sizing on current bankroll (fee-aware odds)
         bet_size = 0.0
         kf = 0.0
         pnl = 0.0
-        if side != "NO EDGE" and current_bankroll > 5.0:
+        if side != "NO EDGE" and filled and current_bankroll > 5.0:
             net_odds = net_odds_after_fees(buy_price, is_maker=as_maker)
             kf = calc_kelly(win_prob, net_odds)
             cap = max_bet if max_bet > 0 else current_bankroll * 0.10
@@ -196,11 +299,12 @@ def run_backtest(
                 bet_size=bet_size,
                 bankroll_after=current_bankroll,
                 kelly_frac=kf,
+                filled=filled,
             )
         )
 
     # Aggregate results
-    actionable = [t for t in trades if t.model_side != "NO EDGE"]
+    actionable = [t for t in trades if t.model_side != "NO EDGE" and t.filled]
     wins = sum(1 for t in actionable if t.won)
     losses = len(actionable) - wins
     total_pnl = current_bankroll - starting_bankroll
@@ -226,6 +330,8 @@ def run_backtest(
         max_drawdown=max_drawdown,
         roi=(current_bankroll - starting_bankroll) / starting_bankroll if starting_bankroll > 0 else 0,
         bankroll_history=bankroll_history,
+        fill_rate_used=fill_rate,
+        fills_missed=fills_missed,
     )
 
 
@@ -242,6 +348,9 @@ def print_backtest(result: BacktestResult) -> None:
     print(f"  Base rate (Up):          {result.base_rate_up:.1%}")
 
     print(f"\n  Actionable signals:      {result.tradeable_windows}")
+    if result.fill_rate_used < 1.0:
+        total_signals = result.tradeable_windows + result.fills_missed
+        print(f"  Fill rate:               {result.fill_rate_used:.0%} ({result.fills_missed} missed of {total_signals} signals)")
     if result.tradeable_windows > 0:
         print(f"  Wins / Losses:           {result.wins} / {result.losses}")
         print(f"  Win rate:                {result.win_rate:.1%}")

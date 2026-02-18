@@ -97,13 +97,21 @@ def backtest(
     bankroll: float = 100.0,
     max_bet: float = 0.0,
     as_maker: bool = False,
+    fill_rate: float = 1.0,
+    use_real_prices: bool = False,
 ) -> None:
     """Run backtest against resolved markets."""
     from poly.backtest import print_backtest, run_backtest
 
     order_type = "MAKER ($0 fee)" if as_maker else "TAKER (1.56% fee)"
+    extras = []
+    if fill_rate < 1.0:
+        extras.append(f"fill={fill_rate:.0%}")
+    if use_real_prices:
+        extras.append("real prices")
+    extra_str = f"  |  {', '.join(extras)}" if extras else ""
     print("=" * 72)
-    print(f"  BACKTEST — Last {hours} hours  |  ${bankroll:,.2f}  |  {order_type}")
+    print(f"  BACKTEST — Last {hours} hours  |  ${bankroll:,.2f}  |  {order_type}{extra_str}")
     print("=" * 72)
     print()
 
@@ -113,6 +121,8 @@ def backtest(
         bankroll=bankroll,
         max_bet=max_bet,
         as_maker=as_maker,
+        fill_rate=fill_rate,
+        use_real_prices=use_real_prices,
     )
     print_backtest(result)
 
@@ -267,6 +277,8 @@ def main():
     p_bt.add_argument("-b", "--bankroll", type=float, default=100.0, help="Starting bankroll (default $100)")
     p_bt.add_argument("-m", "--max-bet", type=float, default=0.0, help="Max bet per trade (default: 10%% of bankroll)")
     p_bt.add_argument("--maker", action="store_true", help="Simulate as maker ($0 fee, buy at bid)")
+    p_bt.add_argument("--fill-rate", type=float, default=1.0, help="Simulated maker fill rate 0.0-1.0 (default 1.0)")
+    p_bt.add_argument("--real-prices", action="store_true", help="Use real historical market prices from CLOB API")
 
     # trade
     p_trade = sub.add_parser("trade", help="Live trading (or dry run)")
@@ -301,6 +313,8 @@ def main():
                 bankroll=args.bankroll,
                 max_bet=args.max_bet,
                 as_maker=getattr(args, 'maker', False),
+                fill_rate=getattr(args, 'fill_rate', 1.0),
+                use_real_prices=getattr(args, 'real_prices', False),
             )
         elif args.command == "trade":
             trade(
