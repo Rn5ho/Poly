@@ -356,18 +356,29 @@ Shows: bankroll, P&L, ROI, WR, trades, drawdown, recent outcomes, last 10 trades
 
 ## Deployment (Hetzner/VPS)
 
+**Server**: `46.225.27.241` (Hetzner, Ubuntu 24.04)
+**GitHub**: `https://github.com/Rn5ho/Poly`
+**No local files on dev machine** — all code lives in GitHub. Deploy by pulling from GitHub on the server.
+
+### Deploying code changes
+
 ```bash
-# 1. Copy to server
-scp -r . root@YOUR_SERVER:/opt/poly
+ssh root@46.225.27.241
+cd /opt/poly
+git fetch origin <branch-name>
+git checkout origin/<branch-name> -- poly/autobot.py  # or whichever files changed
+chown poly:poly poly/*.py
+systemctl restart poly-bot
+```
 
-# 2. Run setup (creates user, venv, systemd services)
-ssh root@YOUR_SERVER 'bash /opt/poly/deploy/setup.sh'
+### Fresh deploy (first time)
 
-# 3. Configure secrets
-ssh root@YOUR_SERVER 'nano /opt/poly/.env'
-
-# 4. Start bot
-ssh root@YOUR_SERVER 'systemctl start poly-bot'
+```bash
+ssh root@46.225.27.241
+cd /opt && git clone https://github.com/Rn5ho/Poly.git poly
+bash /opt/poly/deploy/setup.sh
+nano /opt/poly/.env   # add secrets
+systemctl start poly-bot
 ```
 
 **Systemd services**:
