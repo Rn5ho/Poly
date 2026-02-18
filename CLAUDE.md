@@ -1,6 +1,6 @@
 # CLAUDE.md — Poly
 
-Polymarket 5-minute BTC up/down trading system. Uses outcome mean-reversion (BUY UP after Down windows) with graduated conditional probabilities and quarter-Kelly sizing.
+Polymarket 5-minute BTC up/down trading system. Uses outcome mean-reversion (BUY UP after Down windows) with graduated conditional probabilities, quarter-Kelly sizing, and realistic Polymarket fee modeling.
 
 ## Project Structure
 
@@ -13,7 +13,7 @@ Poly/
     ├── main.py            # CLI entry point — scan, watch, backtest, trade, autobot modes
     ├── btc.py             # BTC price, 1-min momentum, realized volatility (Kraken/CoinGecko)
     ├── polymarket.py      # 5-min market discovery via timestamp-based slug probing
-    ├── model.py           # Conditional mean-reversion model: P(Up|prev outcomes), Kelly sizing
+    ├── model.py           # Conditional mean-reversion model: P(Up|prev outcomes), Kelly sizing, fees
     ├── backtest.py        # Backtesting engine: reconstruct snapshots, validate vs outcomes
     ├── execute.py         # Order execution via py-clob-client (limit + market orders)
     └── autobot.py         # Automated continuous trading bot with state persistence
@@ -30,8 +30,8 @@ Each market asks: "Will BTC go up or down in this 5-minute window?" Resolves via
 1. **Discovery**: Generate `btc-updown-5m-{timestamp}` slugs and probe Gamma API
 2. **Outcomes**: Fetch recent resolved window outcomes (Up/Down sequence)
 3. **Model**: Conditional P(Up) based on previous outcome streaks (mean-reversion)
-4. **Signal**: Compare model P(Up) to market price (~50.5%) → flag when edge > 3%
-5. **Sizing**: Quarter-Kelly criterion with 10% bankroll cap
+4. **Signal**: Compare model P(Up) to buy price (~$0.51 ask) → flag when edge > 3%
+5. **Sizing**: Quarter-Kelly criterion with 10% bankroll cap, fee-aware odds
 6. **Execution**: Place orders via Polymarket CLOB API (or dry-run simulate)
 
 ## Key Commands
@@ -55,7 +55,7 @@ python -m poly.main backtest -H 152 -b 500         # Full history since launch, 
 python -m poly.main trade                          # Dry run
 python -m poly.main trade --live                   # REAL orders
 
-# Autobot — automated continuous trading (NEW)
+# Autobot — automated continuous trading
 python -m poly.main autobot                        # Dry run, $500 bankroll, quarter-Kelly
 python -m poly.main autobot -b 1000               # $1000 bankroll
 python -m poly.main autobot -k 0.5                # Half-Kelly (more aggressive)
@@ -63,6 +63,38 @@ python -m poly.main autobot --live                 # REAL orders (requires POLY_
 python -m poly.main autobot --fresh                # Ignore saved state, start fresh
 python -m poly.autobot                             # Direct module execution
 ```
+
+## Polymarket Fee Model
+
+5-minute crypto markets have **taker-only fees** (since launch Feb 12, 2026). Maker orders are free.
+
+### Fee Structure
+- **Taker fee**: parabolic `fee(p) = p * (1-p) * 0.0175`, max ~0.44% at p=0.50
+- **Maker fee**: $0 (+ eligible for 20% rebate of taker fee pool)
+- **Settlement**: winning shares pay exactly $1.00, no fee at payout
+- **Losing shares**: worth $0, you lose the full purchase price
+
+### Typical Market Pricing
+- **Bid**: $0.500, **Ask**: $0.510, **Spread**: $0.01, **Mid**: $0.505
+- These markets are liquid ($5-15k per window)
+
+### Per-Trade Economics (as taker)
+
+| Component | Value |
+|-----------|-------|
+| Buy price (ask) | $0.510 |
+| Taker fee | 0.44% (deducted from shares received) |
+| Net odds on win | 0.9522 ($0.9522 profit per $1 bet) |
+| Net odds without fees | 0.9802 |
+| **Total cost drag** | **2.9% of gross odds** |
+
+| Signal | EV per $1 (with fees) | EV per $1 (no fees) |
+|--------|----------------------|---------------------|
+| After 1x Down (56.0%) | +$0.093 (+9.3%) | +$0.109 (+10.9%) |
+| After 2x Down (57.6%) | +$0.125 (+12.5%) | +$0.141 (+14.1%) |
+| After 3x Down (59.0%) | +$0.152 (+15.2%) | +$0.168 (+16.8%) |
+
+**Bottom line**: Fees eat ~15% of gross EV. The edge survives comfortably.
 
 ## Model Design
 
@@ -74,23 +106,27 @@ After a Down window, the next window has a higher-than-market probability of bei
 
 ### Calibration Data
 
-6-day backtest over 1,823 resolved windows (Feb 12-18 2026, 864 actionable trades):
+6-day backtest over 1,823 resolved windows (Feb 12-18 2026, 861 actionable trades):
 
-| Pattern | P(Up) | N | 95% CI | Edge vs 50.5% | Signal |
-|---------|-------|---|--------|----------------|--------|
-| After 1x Down | 56.0% | 863 | [52.6%, 59.2%] | +5.5% | BUY UP |
-| After 2x Down | 57.6% | 380 | [52.6%, 62.5%] | +7.1% | BUY UP |
-| After 3x+ Down | 59.0% | 161 | [51.3%, 66.3%] | +8.5% | BUY UP |
-| After 1x Up | 49.5% | 959 | — | -1.0% | skip |
-| After 2x+ Up | 47.4% | 475 | — | -3.1% | skip |
-| Base rate | 52.6% | 1,823 | — | +2.1% | skip |
+| Pattern | P(Up) | N | 95% CI | Edge vs 51.0% ask | Signal |
+|---------|-------|---|--------|-------------------|--------|
+| After 1x Down | 56.0% | 863 | [52.6%, 59.2%] | +5.0% | BUY UP |
+| After 2x Down | 57.6% | 380 | [52.6%, 62.5%] | +6.6% | BUY UP |
+| After 3x+ Down | 59.0% | 161 | [51.3%, 66.3%] | +8.0% | BUY UP |
+| After 1x Up | 49.5% | 959 | — | -1.5% | skip |
+| After 2x+ Up | 47.4% | 475 | — | -3.6% | skip |
+| Base rate | 52.6% | 1,823 | — | +1.6% | skip |
 
-### Backtest Results (updated model, $500 start)
+### Backtest Results (fee-aware, $500 start, quarter-Kelly)
 
-- **Win rate**: 55.9% over 864 trades
-- **P&L**: $500 → $7,656 (+1,431% ROI)
-- **Max drawdown**: 42.5% (vs 74.6% with old half-Kelly)
+- **Win rate**: 56.0% over 861 trades
+- **P&L**: $500 → $4,288 (+758% ROI)
+- **Max drawdown**: 40.4%
 - **Zero ruin risk** at $500+ starting bankroll
+- **Avg bet**: $60, **Avg P&L/trade**: +$4.40
+
+### Without fees (for comparison)
+- **P&L**: $500 → $7,656 (+1,431% ROI) — fees reduce returns by ~45%
 
 ### Model Parameters (`model.py`)
 
@@ -106,19 +142,21 @@ After a Down window, the next window has a higher-than-market probability of bei
 | `KELLY_MULTIPLIER` | 0.25 | Quarter-Kelly (0% ruin at $500+) |
 | `MAX_BET_PCT` | 0.10 | Never bet > 10% of bankroll |
 | `MIN_BET` | 5.0 | Polymarket minimum order |
+| `FEE_RATE_BASE` | 0.0175 | 5-min crypto taker fee (175 bps) |
+| `DEFAULT_BUY_PRICE` | 0.510 | Typical ask price on these markets |
 
 ### Position Sizing
 
-Quarter-Kelly criterion (0.25x full Kelly):
-- `f* = (p(b+1) - 1) / b * 0.25`
-- At P(Up)=57.6%, odds≈0.98: quarter-Kelly = 3.6% of bankroll
+Quarter-Kelly criterion (0.25x full Kelly) with **fee-adjusted odds**:
+- `net_odds = (1/buy_price) * (1 - taker_fee) - 1`
+- At P(Up)=57.6%, net_odds=0.9522: quarter-Kelly = 3.3% of bankroll
 - Max capped at 10% of bankroll
 - Minimum: $5 (Polymarket minimum)
 
 **Why quarter-Kelly?** Ruin analysis over 863 trades:
 - Half-Kelly ($100 start): 35.6% chance of bot death (bankroll < $5 min bet)
-- Quarter-Kelly ($500 start): 0% death rate, 39.8% max drawdown
-- Half-Kelly ($500 start): 0% death rate, but 66.2% max drawdown
+- Quarter-Kelly ($500 start): 0% death rate, 40.4% max drawdown
+- Half-Kelly ($500 start): 0% death rate, but 66.7% max drawdown
 
 ### Rolling Win Rate Stability
 
@@ -130,7 +168,7 @@ Quarter-Kelly criterion (0.25x full Kelly):
 
 1. **Wait** for next 5-minute window (places orders 30s before start)
 2. **Evaluate** conditional P(Up) from recent outcome sequence
-3. **Size** bet via quarter-Kelly if edge > threshold
+3. **Size** bet via quarter-Kelly if edge > threshold (fee-aware odds)
 4. **Execute** trade (dry-run or live via CLOB)
 5. **Resolve** — poll Gamma API for outcome, update bankroll
 6. **Persist** state to `poly_bot_state.json` after every cycle
@@ -174,6 +212,11 @@ export POLY_PRIVATE_KEY="0x..."      # Polygon wallet private key
 export POLY_FUNDER="0x..."           # Optional: proxy wallet address
 ```
 
+**Maker vs Taker**:
+- `place_market_order()` — FOK, always taker (pays ~0.44% fee)
+- `place_limit_order()` — GTC, maker if it rests on book (no fee + rebate eligible)
+- Post-only orders available (guaranteed maker, rejected if would immediately fill)
+
 ## Conventions
 
 - **Python 3.11+** — uses `X | None` union syntax
@@ -187,6 +230,8 @@ export POLY_FUNDER="0x..."           # Optional: proxy wallet address
 
 - **Outcome mean-reversion** is the core insight: After Down windows, Up probability increases. Deeper Down streaks → stronger signal. Discovered through 1,823-window calibration.
 - **BUY DOWN is dead**: No bearish conditional pattern survives 95% CI testing. The model is BUY UP only.
-- **Quarter-Kelly** is the sizing sweet spot: Enough to compound (1,431% ROI over 6 days) but 0% ruin risk at $500+ bankroll and manageable 42.5% max drawdown.
+- **Quarter-Kelly** is the sizing sweet spot: Enough to compound (758% ROI over 6 days with fees) but 0% ruin risk at $500+ bankroll and manageable 40.4% max drawdown.
+- **Fees are real but survivable**: 0.44% taker fee + 1¢ spread = ~2.9% drag on odds. The 5.0-8.0% edge absorbs this.
 - **Resolution source is Chainlink**, not exchange spot prices.
 - **Autobot waits for every window** even when not trading, to keep the outcome sequence current for conditional model.
+- **Maker orders eliminate fees entirely** — future optimization could use limit orders placed early to get maker status and collect rebates.

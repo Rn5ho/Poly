@@ -38,6 +38,33 @@ KELLY_MULTIPLIER = 0.25  # quarter-Kelly (0% ruin risk at $500+)
 MAX_BET_PCT = 0.10  # never bet more than 10% of bankroll
 MIN_BET = 5.0  # Polymarket minimum
 
+# Polymarket fee model (5-min crypto markets)
+# Taker fee: parabolic curve fee(p) = p * (1-p) * FEE_RATE_BASE
+# Max ~0.44% at p=0.50. Maker orders are fee-free.
+# Fee is deducted from shares received, not USDC spent.
+FEE_RATE_BASE = 0.0175  # 175 bps base rate for 5-min crypto
+DEFAULT_BUY_PRICE = 0.510  # typical ask price (bid=0.50, ask=0.51, mid=0.505)
+
+
+def taker_fee_rate(price: float) -> float:
+    """Polymarket taker fee per share at given price.
+
+    5-min crypto markets use a parabolic fee curve:
+    fee = p * (1-p) * 0.0175, max ~0.44% at p=0.50.
+    """
+    return price * (1 - price) * FEE_RATE_BASE
+
+
+def net_odds_after_fees(buy_price: float, is_maker: bool = False) -> float:
+    """Net profit per $1 bet after fees and spread.
+
+    As taker buying at ask: shares = (1/ask) * (1 - fee), payout = shares * $1
+    As maker buying at mid: shares = 1/mid, payout = shares * $1 (no fee)
+    """
+    fee = 0.0 if is_maker else taker_fee_rate(buy_price)
+    shares_per_dollar = (1.0 / buy_price) * (1 - fee)
+    return shares_per_dollar - 1.0  # profit per $1 risked
+
 
 @dataclass
 class Signal:

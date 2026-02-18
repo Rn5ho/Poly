@@ -28,12 +28,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from poly.model import (
+    DEFAULT_BUY_PRICE,
     DEFAULT_EDGE_THRESHOLD,
     KELLY_MULTIPLIER,
     MAX_BET_PCT,
     MIN_BET,
     conditional_prob_up,
     kelly_fraction,
+    net_odds_after_fees,
 )
 from poly.polymarket import (
     WINDOW_SECONDS,
@@ -265,10 +267,10 @@ def _run_one_cycle(
         while time.time() < target_time:
             time.sleep(min(5.0, target_time - time.time()))
 
-    # Evaluate signal
+    # Evaluate signal (edge computed vs actual buy price including spread)
     model_up = conditional_prob_up(state.recent_outcomes)
-    market_up = 0.505  # markets consistently price at ~50.5%
-    edge = model_up - market_up
+    buy_price = DEFAULT_BUY_PRICE  # 0.510 (typical ask)
+    edge = model_up - buy_price
 
     down_streak = 0
     for o in reversed(state.recent_outcomes):
@@ -291,8 +293,8 @@ def _run_one_cycle(
         _wait_and_update_outcomes(state, next_ts)
         return
 
-    # Size the bet
-    net_odds = (1.0 - market_up) / market_up
+    # Size the bet (fee-aware odds)
+    net_odds = net_odds_after_fees(buy_price, is_maker=False)
     kf = kelly_fraction(model_up, net_odds, kelly_mult)
     cap = state.bankroll * max_bet_pct
     bet_size = min(state.bankroll * kf, cap, state.bankroll)
