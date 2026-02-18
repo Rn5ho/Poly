@@ -97,13 +97,21 @@ def backtest(
     bankroll: float = 100.0,
     max_bet: float = 0.0,
     as_maker: bool = False,
+    fill_rate: float = 1.0,
+    use_real_prices: bool = False,
 ) -> None:
     """Run backtest against resolved markets."""
     from poly.backtest import print_backtest, run_backtest
 
     order_type = "MAKER ($0 fee)" if as_maker else "TAKER (1.56% fee)"
+    extras = []
+    if fill_rate < 1.0:
+        extras.append(f"fill={fill_rate:.0%}")
+    if use_real_prices:
+        extras.append("real prices")
+    extra_str = f"  |  {', '.join(extras)}" if extras else ""
     print("=" * 72)
-    print(f"  BACKTEST — Last {hours} hours  |  ${bankroll:,.2f}  |  {order_type}")
+    print(f"  BACKTEST — Last {hours} hours  |  ${bankroll:,.2f}  |  {order_type}{extra_str}")
     print("=" * 72)
     print()
 
@@ -113,6 +121,8 @@ def backtest(
         bankroll=bankroll,
         max_bet=max_bet,
         as_maker=as_maker,
+        fill_rate=fill_rate,
+        use_real_prices=use_real_prices,
     )
     print_backtest(result)
 
@@ -244,6 +254,96 @@ def _print_summary(actionable: list) -> None:
     print()
 
 
+def _show_status() -> None:
+    """Print current bot status from saved state and trade log."""
+    import json
+    from pathlib import Path
+
+    state_file = Path("poly_bot_state.json")
+    log_file = Path("poly_bot_log.jsonl")
+
+    print("=" * 72)
+    print("  POLY BOT STATUS")
+    print("=" * 72)
+
+    # Load state
+    if state_file.exists():
+        state = json.loads(state_file.read_text())
+        bankroll = state.get("bankroll", 0)
+        starting = state.get("starting_bankroll", 0)
+        peak = state.get("peak_bankroll", 0)
+        trades = state.get("total_trades", 0)
+        wins = state.get("total_wins", 0)
+        pnl = state.get("total_pnl", 0)
+        max_dd = state.get("max_drawdown", 0)
+        stopouts = state.get("total_stopouts", 0)
+        recent = state.get("recent_outcomes", [])
+        mode = "DRY RUN" if state.get("dry_run", True) else "LIVE"
+        order_type = "MAKER" if state.get("use_maker") else "TAKER"
+        wr = wins / trades if trades > 0 else 0
+        roi = ((bankroll - starting) / starting) if starting > 0 else 0
+
+        print(f"\n  Mode:        {mode} ({order_type})")
+        print(f"  Started:     {state.get('started_at', '?')}")
+        print(f"\n  Bankroll:    ${bankroll:,.2f}")
+        print(f"  Starting:    ${starting:,.2f}")
+        print(f"  Peak:        ${peak:,.2f}")
+        print(f"  P&L:         ${pnl:+,.2f}  ({roi:+.1%} ROI)")
+        print(f"\n  Trades:      {trades}")
+        print(f"  Win rate:    {wr:.1%}  ({wins}W / {trades - wins}L)")
+        print(f"  Max DD:      {max_dd:.1%}")
+        print(f"  Stop-outs:   {stopouts}")
+        print(f"\n  Recent:      {' -> '.join(recent) if recent else 'N/A'}")
+    else:
+        print("\n  No saved state found (poly_bot_state.json)")
+
+    # Load recent trades from log
+    if log_file.exists():
+        log_lines = log_file.read_text().strip().split("\n")
+        log_trades = []
+        for line in log_lines:
+            if line.strip():
+                try:
+                    log_trades.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+        if log_trades:
+            print(f"\n  --- LAST 10 TRADES ---")
+            print(f"  {'Time UTC':>14}  {'Side':>8}  {'Type':>6}  {'Bet':>8}  {'P&L':>9}  {'Bank':>9}  {'Result':>6}")
+            print(f"  {'-'*14}  {'-'*8}  {'-'*6}  {'-'*8}  {'-'*9}  {'-'*9}  {'-'*6}")
+            for t in log_trades[-10:]:
+                ts = t.get("ts", 0)
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
+                time_str = dt.strftime("%m-%d %H:%M") if dt else "?"
+                result = "WIN" if t.get("won") else ("STOP" if t.get("stopped_out") else "LOSS")
+                pnl_val = t.get("pnl", 0)
+                print(
+                    f"  {time_str:>14}  {t.get('side', '?'):>8}  "
+                    f"{t.get('order_type', '?'):>6}  "
+                    f"${t.get('bet', 0):>7.2f}  "
+                    f"{'+'if pnl_val>=0 else ''}${pnl_val:>7.2f}  "
+                    f"${t.get('bankroll', 0):>8.2f}  "
+                    f"{result:>6}"
+                )
+
+            # Today's stats
+            today_start = int(datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0
+            ).timestamp())
+            today = [t for t in log_trades if t.get("ts", 0) >= today_start]
+            if today:
+                today_wins = sum(1 for t in today if t.get("won"))
+                today_pnl = sum(t.get("pnl", 0) for t in today)
+                today_wr = today_wins / len(today) if today else 0
+                print(f"\n  --- TODAY ---")
+                print(f"  Trades: {len(today)}  |  WR: {today_wr:.1%}  |  P&L: ${today_pnl:+,.2f}")
+    else:
+        print("\n  No trade log found (poly_bot_log.jsonl)")
+
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Polymarket 5-minute BTC up/down trading system.",
@@ -267,6 +367,8 @@ def main():
     p_bt.add_argument("-b", "--bankroll", type=float, default=100.0, help="Starting bankroll (default $100)")
     p_bt.add_argument("-m", "--max-bet", type=float, default=0.0, help="Max bet per trade (default: 10%% of bankroll)")
     p_bt.add_argument("--maker", action="store_true", help="Simulate as maker ($0 fee, buy at bid)")
+    p_bt.add_argument("--fill-rate", type=float, default=1.0, help="Simulated maker fill rate 0.0-1.0 (default 1.0)")
+    p_bt.add_argument("--real-prices", action="store_true", help="Use real historical market prices from CLOB API")
 
     # trade
     p_trade = sub.add_parser("trade", help="Live trading (or dry run)")
@@ -287,6 +389,14 @@ def main():
     p_auto.add_argument("--taker", action="store_true", help="Use taker orders (1.56% fee)")
     p_auto.add_argument("--stoploss", action="store_true", help="Enable stop-loss during live windows")
 
+    # status
+    sub.add_parser("status", help="Show current bot status from saved state/logs")
+
+    # dashboard
+    p_dash = sub.add_parser("dashboard", help="Run web dashboard")
+    p_dash.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    p_dash.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
+
     args = parser.parse_args()
 
     try:
@@ -301,6 +411,8 @@ def main():
                 bankroll=args.bankroll,
                 max_bet=args.max_bet,
                 as_maker=getattr(args, 'maker', False),
+                fill_rate=getattr(args, 'fill_rate', 1.0),
+                use_real_prices=getattr(args, 'real_prices', False),
             )
         elif args.command == "trade":
             trade(
@@ -323,6 +435,11 @@ def main():
                 use_maker=use_maker,
                 enable_stoploss=args.stoploss,
             )
+        elif args.command == "status":
+            _show_status()
+        elif args.command == "dashboard":
+            from poly.dashboard import run_dashboard
+            run_dashboard(host=args.host, port=args.port)
         else:
             # Default: scan
             scan()

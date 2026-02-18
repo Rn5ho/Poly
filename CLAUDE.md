@@ -7,16 +7,24 @@ Polymarket 5-minute BTC up/down trading system. Uses outcome mean-reversion (BUY
 ```
 Poly/
 ├── CLAUDE.md              # This file
-├── requirements.txt       # Python deps: requests, scipy, numpy
+├── requirements.txt       # Python deps: requests, scipy, numpy, websockets
+├── deploy/                # Deployment helpers
+│   ├── setup.sh           # Hetzner/VPS setup script (systemd, venv, .env)
+│   ├── poly-bot.service   # systemd unit for autobot
+│   ├── poly-dashboard.service  # systemd unit for web dashboard
+│   └── env.example        # Environment variable template
 └── poly/                  # Main package
     ├── __init__.py
-    ├── main.py            # CLI entry point — scan, watch, backtest, trade, autobot modes
+    ├── main.py            # CLI entry — scan, watch, backtest, trade, autobot, status, dashboard
     ├── btc.py             # BTC price, 1-min momentum, realized volatility (Kraken/CoinGecko)
-    ├── polymarket.py      # 5-min market discovery via timestamp-based slug probing + CLOB book
+    ├── polymarket.py      # 5-min market discovery, CLOB book, live prices, price history
     ├── model.py           # Conditional mean-reversion model: P(Up|prev outcomes), Kelly sizing, fees
-    ├── backtest.py        # Backtesting engine: reconstruct snapshots, validate vs outcomes
-    ├── execute.py         # Order execution: maker/taker buys, sell (cash-out/stop-loss), cancel
-    └── autobot.py         # Automated continuous trading bot with maker orders + stop-loss
+    ├── backtest.py        # Backtesting engine: real prices, fill-rate simulation
+    ├── execute.py         # Order execution: maker/taker, fill verification, sell, cancel
+    ├── autobot.py         # Automated bot: live book, fill verification, WS stop-loss, Telegram
+    ├── ws.py              # WebSocket client: market price streaming, user fill events
+    ├── notify.py          # Telegram notifications: trade alerts, outcomes, daily summary
+    └── dashboard.py       # Web dashboard: equity curve, trade table, stats (Flask/built-in)
 ```
 
 ## How It Works
@@ -53,6 +61,8 @@ python -m poly.main backtest                       # Last 6 hours, as taker
 python -m poly.main backtest --maker               # As maker ($0 fee)
 python -m poly.main backtest -H 152 -b 500         # Full history since launch
 python -m poly.main backtest -H 152 -b 500 --maker # Full history, maker pricing
+python -m poly.main backtest --maker --fill-rate 0.5   # 50% maker fill rate
+python -m poly.main backtest --maker --real-prices     # Use actual CLOB prices
 
 # Trade — single-shot trading
 python -m poly.main trade                          # Dry run
@@ -67,6 +77,14 @@ python -m poly.main autobot -b 1000               # $1000 bankroll
 python -m poly.main autobot -k 0.5                # Half-Kelly (more aggressive)
 python -m poly.main autobot --fresh                # Ignore saved state, start fresh
 python -m poly.autobot                             # Direct module execution
+
+# Status — check bot state and recent trades from terminal
+python -m poly.main status                         # Read state file + trade log
+
+# Dashboard — web UI for monitoring
+python -m poly.main dashboard                      # http://0.0.0.0:8080
+python -m poly.main dashboard --port 9090          # Custom port
+python -m poly.dashboard                           # Direct module execution
 ```
 
 ## Polymarket Fee Model
@@ -211,12 +229,14 @@ Quarter-Kelly criterion (0.25x full Kelly) with **fee-adjusted odds**:
 `autobot.py` runs a continuous loop:
 
 1. **Wait** for next 5-minute window (places orders 30s before start)
-2. **Evaluate** conditional P(Up) from recent outcome sequence
-3. **Size** bet via quarter-Kelly if edge > threshold
-4. **Execute** maker limit buy at $0.50 (or taker FOK at $0.51)
-5. **Monitor** (optional) live window for stop-loss trigger
-6. **Resolve** — poll Gamma API for outcome, update bankroll
-7. **Persist** state to `poly_bot_state.json` after every cycle
+2. **Book** — fetch live order book for real bid/ask prices
+3. **Evaluate** conditional P(Up) from recent outcome sequence
+4. **Size** bet via quarter-Kelly if edge > threshold (using live prices)
+5. **Execute** maker limit buy at live bid (or taker FOK at live ask)
+6. **Verify** — poll order status for fill confirmation, cancel unfilled on timeout
+7. **Monitor** (optional) WebSocket-based stop-loss during live window (REST fallback)
+8. **Resolve** — poll Gamma API for outcome, update bankroll using actual fill size
+9. **Persist** state to `poly_bot_state.json` after every cycle
 
 **New flags**:
 - `--maker` (default) — use post-only limit orders at bid ($0 fee, 2x EV)
@@ -248,6 +268,11 @@ export POLY_FUNDER="0x..."           # Optional: proxy wallet address
 - `cancel_order(order_id)` — Cancel a resting order
 - `cancel_all_orders()` — Cancel all resting orders
 
+**Fill Verification** (new):
+- `get_order_status(order_id)` → `OrderStatus` with `size_matched`, `original_size`, `fill_fraction`
+- `wait_for_fill(order_id, timeout, poll_interval, cancel_on_timeout)` → polls until filled or timeout
+- `get_trades_for_market(market_id, after_ts)` → executed trade audit trail
+
 ## External APIs
 
 | API | Base URL | Used For | Auth |
@@ -273,20 +298,101 @@ Also available (not yet implemented):
 ## Conventions
 
 - **Python 3.11+** — uses `X | None` union syntax
-- Pure Python: `requests`, `scipy`, `numpy` (+ optional `py-clob-client`)
+- Pure Python: `requests`, `scipy`, `numpy` (+ optional `flask`, `py-clob-client`)
 - All timestamps are Unix seconds (UTC)
 - Polymarket outcomes are "Up" / "Down" (not Yes/No) for 5-min markets
 - Positive edge = Up is underpriced → BUY UP
 - Signal sides: `"BUY UP"`, `"NO EDGE"` (BUY DOWN removed — not profitable)
+
+## Monitoring & Notifications
+
+Three channels for observing the bot:
+
+### 1. Telegram Alerts (`notify.py`)
+
+Push notifications to your phone on every trade event.
+
+**Setup**:
+```bash
+# 1. Create bot via @BotFather → get token
+# 2. Get chat ID: curl https://api.telegram.org/bot<TOKEN>/getUpdates
+export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
+export TELEGRAM_CHAT_ID="987654321"
+```
+
+**Events notified**:
+| Event | When | Content |
+|-------|------|---------|
+| Startup | Bot starts | Mode, bankroll, settings |
+| Trade placed | Order submitted | Side, size, price, edge, streak |
+| Fill update | Maker fill verified | Shares filled, fill % |
+| Outcome | Window resolves | WIN/LOSS, P&L, bankroll, WR |
+| Stop-loss | Price < 30c | Exit price, recovery %, P&L |
+| Daily summary | ~00:00 UTC | 24h trades, WR, P&L, drawdown |
+| Error | Exception caught | Error message |
+| Shutdown | Bot stops | Final bankroll, stats |
+
+Uses raw `requests` to Telegram Bot API — no extra dependency. All sends are non-blocking (background threads). Gracefully degrades if not configured (no env vars = no notifications).
+
+### 2. Web Dashboard (`dashboard.py`)
+
+Single-page web UI served on port 8080. Reads `poly_bot_state.json` and `poly_bot_log.jsonl`.
+
+**Features**:
+- Equity curve (Chart.js)
+- Summary cards: bankroll, P&L, WR, drawdown, streak, today's stats
+- Recent outcomes pill display
+- Trade table with fill %, edge, P&L
+- Auto-refreshes every 60 seconds
+- JSON API: `GET /api/status`, `GET /api/trades`
+
+**Dependencies**: `flask` (optional — falls back to Python's built-in `http.server`).
+
+### 3. CLI Status (`python -m poly.main status`)
+
+Terminal command that reads state/log files and prints a summary. Zero dependencies, works over SSH.
+
+Shows: bankroll, P&L, ROI, WR, trades, drawdown, recent outcomes, last 10 trades, today's stats.
+
+## Deployment (Hetzner/VPS)
+
+```bash
+# 1. Copy to server
+scp -r . root@YOUR_SERVER:/opt/poly
+
+# 2. Run setup (creates user, venv, systemd services)
+ssh root@YOUR_SERVER 'bash /opt/poly/deploy/setup.sh'
+
+# 3. Configure secrets
+ssh root@YOUR_SERVER 'nano /opt/poly/.env'
+
+# 4. Start bot
+ssh root@YOUR_SERVER 'systemctl start poly-bot'
+```
+
+**Systemd services**:
+| Service | Command | Port |
+|---------|---------|------|
+| `poly-bot` | Autobot (maker, dry-run by default) | — |
+| `poly-dashboard` | Web dashboard | 8080 |
+
+**Logs**: `/var/log/poly/bot.log`, `/var/log/poly/dashboard.log`, or `journalctl -u poly-bot -f`
+
+**To switch to live trading**: Edit `/etc/systemd/system/poly-bot.service`, change `ExecStart` to include `--live`, then `systemctl daemon-reload && systemctl restart poly-bot`.
 
 ## Architecture Notes
 
 - **Outcome mean-reversion** is the core insight: After Down windows, Up probability increases. Deeper Down streaks → stronger signal.
 - **BUY DOWN is dead**: No bearish conditional pattern survives 95% CI testing.
 - **Maker orders are the #1 profitability lever**: $0 fee + 1c better price = 2x EV vs taker. Default mode.
+- **Fill verification is critical**: Maker orders queue behind existing liquidity. The bot polls `GET /data/order/<id>` to confirm `size_matched` before counting a trade. Unfilled orders are canceled before window start.
+- **Live book prices** replace hardcoded bid/ask. The bot fetches the CLOB order book before every trade to use real bid/ask for edge calculation and sizing.
 - **Cash-out (sell early)** is the #2 lever: Stop-loss at 30c limits losing trades from -100% to ~-40%.
+- **WebSocket stop-loss** uses the market channel for sub-second price updates (falls back to REST polling if unavailable).
 - **Quarter-Kelly** is the sizing sweet spot: 0% ruin risk at $500+ bankroll.
 - **Fees are significant but survivable**: 1.56% taker fee eats ~50% of EV. Maker eliminates it.
 - **Resolution source is Chainlink**, not exchange spot prices.
 - **Autobot waits for every window** even when not trading, to keep outcome sequence current.
-- **CLOB order book** has decent liquidity (~930 shares at bid, 200+ per ask level).
+- **Backtest honesty**: `--fill-rate` simulates partial maker fills, `--real-prices` uses actual historical CLOB prices instead of assumed constants.
+- **Telegram notifications** are non-blocking (background threads) and gracefully degrade if not configured. The bot runs identically with or without Telegram.
+- **Web dashboard** reads the same JSONL log and state file the bot writes. No coupling — dashboard can be restarted independently. Falls back to Python built-in HTTP server if Flask is not installed.

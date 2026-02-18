@@ -4,6 +4,12 @@ Runs continuously, placing trades every 5-minute window based on
 the conditional mean-reversion model. Tracks its own bankroll,
 trade history, and performance metrics.
 
+Key features:
+  - Live book prices (no hardcoded bid/ask assumptions)
+  - Fill verification for maker orders (poll until filled or cancel)
+  - WebSocket-based stop-loss monitoring (with REST fallback)
+  - Actual fill size used for P&L (not requested size)
+
 Execution modes:
   --maker     Use maker (post-only) limit orders at bid ($0 fee)
   --taker     Use taker market orders at ask (1.56% fee, default)
@@ -18,10 +24,12 @@ Usage:
 The bot:
 1. Waits for each 5-minute window boundary
 2. Fetches the most recent resolved outcomes
-3. Computes conditional P(Up) using graduated Down-streak model
-4. If edge > threshold, sizes a quarter-Kelly bet and places it
-5. Optionally: monitors live window for stop-loss (sell if Up < 30c)
-6. Waits for resolution, updates bankroll, repeats
+3. Fetches live order book for real bid/ask prices
+4. Computes conditional P(Up) using graduated Down-streak model
+5. If edge > threshold, sizes a quarter-Kelly bet and places it
+6. Verifies fill (maker) — cancels unfilled orders before window start
+7. Optionally: monitors live window for stop-loss (sell if Up < 30c)
+8. Waits for resolution, updates bankroll using actual fill size, repeats
 """
 
 import json
@@ -45,10 +53,22 @@ from poly.model import (
     kelly_fraction,
     net_odds_after_fees,
 )
+from poly.notify import (
+    is_configured as _tg_configured,
+    notify_error,
+    notify_fill,
+    notify_outcome,
+    notify_shutdown,
+    notify_startup,
+    notify_stoploss,
+    notify_trade_placed,
+    send_daily_summary,
+)
 from poly.polymarket import (
     WINDOW_SECONDS,
     _fetch_5m_market,
     _fetch_resolved_outcome,
+    fetch_live_book,
     fetch_order_book,
     fetch_recent_outcomes,
 )
@@ -172,59 +192,104 @@ def _get_up_price_from_clob(token_id: str) -> float | None:
 def _monitor_stoploss(
     window_ts: int,
     up_token_id: str,
-    bet_size: float,
+    shares_held: float,
     buy_price: float,
-    state: BotState,
-    sell_fn=None,
+    bet_size: float,
+    dry_run: bool,
+    condition_id: str | None = None,
 ) -> dict | None:
     """Monitor live window for stop-loss trigger.
 
-    Polls the Up token price every STOPLOSS_POLL seconds.
-    If Up price drops below STOP_LOSS_PRICE, sells to limit losses.
+    Tries WebSocket streaming first for sub-second price updates.
+    Falls back to REST polling if WebSocket is unavailable.
+
+    Args:
+        window_ts: Window start timestamp.
+        up_token_id: CLOB token ID for Up shares.
+        shares_held: Actual number of shares held (from fill verification).
+        buy_price: Price paid per share.
+        bet_size: Total USD spent.
+        dry_run: If True, simulate sells.
+        condition_id: Market condition ID (for WebSocket subscription).
 
     Returns:
         dict with stop-loss details if triggered, None otherwise.
     """
     window_end = window_ts + WINDOW_SECONDS
-    shares_held = bet_size / buy_price  # approximate shares
 
-    while time.time() < window_end - 10:  # stop monitoring 10s before end
-        current_price = _get_up_price_from_clob(up_token_id)
+    # Try WebSocket-based monitoring first
+    stream = _try_start_market_stream(up_token_id, condition_id)
+    use_ws = stream is not None
 
-        if current_price is not None and current_price < STOP_LOSS_PRICE:
-            _print(
-                f"    STOP-LOSS TRIGGERED: Up={current_price:.2f} < {STOP_LOSS_PRICE:.2f}"
-            )
-
-            # Execute sell (or simulate)
-            if sell_fn and not state.dry_run:
-                from poly.execute import sell_shares
-                result = sell_shares(
-                    up_token_id, shares_held, price=current_price, as_maker=False
-                )
-                if result.success:
-                    _print(f"    SOLD: {result.order_id}")
-                else:
-                    _print(f"    SELL FAILED: {result.error}")
-                    return None
+    try:
+        while time.time() < window_end - 10:  # stop 10s before end
+            # Get price from WebSocket or REST fallback
+            if use_ws and stream.last_price is not None:
+                current_price = stream.last_price
             else:
+                current_price = _get_up_price_from_clob(up_token_id)
+
+            if current_price is not None and current_price < STOP_LOSS_PRICE:
                 _print(
-                    f"    [DRY RUN] Would sell {shares_held:.1f} shares at {current_price:.2f}"
+                    f"    STOP-LOSS TRIGGERED: Up={current_price:.2f} < {STOP_LOSS_PRICE:.2f}"
                 )
 
-            # Calculate stop-loss P&L
-            recovery = shares_held * current_price
-            pnl = recovery - bet_size
-            return {
-                "stopped": True,
-                "exit_price": current_price,
-                "pnl": pnl,
-                "recovery_pct": recovery / bet_size,
-            }
+                # Execute sell
+                if not dry_run:
+                    from poly.execute import sell_shares
+                    result = sell_shares(
+                        up_token_id, shares_held, price=current_price, as_maker=False
+                    )
+                    if result.success:
+                        _print(f"    SOLD: {result.order_id}")
+                    else:
+                        _print(f"    SELL FAILED: {result.error}")
+                        # Retry once as taker market sell (no price)
+                        result = sell_shares(
+                            up_token_id, shares_held, price=None, as_maker=False
+                        )
+                        if result.success:
+                            _print(f"    SOLD (retry): {result.order_id}")
+                        else:
+                            _print(f"    SELL RETRY FAILED: {result.error}")
+                            return None
+                else:
+                    _print(
+                        f"    [DRY RUN] Would sell {shares_held:.1f} shares at {current_price:.2f}"
+                    )
 
-        time.sleep(STOPLOSS_POLL)
+                recovery = shares_held * current_price
+                pnl = recovery - bet_size
+                return {
+                    "stopped": True,
+                    "exit_price": current_price,
+                    "pnl": pnl,
+                    "recovery_pct": recovery / bet_size if bet_size > 0 else 0,
+                }
+
+            # WebSocket provides sub-second updates; REST needs explicit sleep
+            if not use_ws or stream.last_price is None:
+                time.sleep(STOPLOSS_POLL)
+            else:
+                time.sleep(1)  # light sleep between WS checks
+    finally:
+        if stream:
+            stream.stop()
 
     return None  # no stop-loss triggered
+
+
+def _try_start_market_stream(token_id: str, condition_id: str | None = None):
+    """Try to start a WebSocket market stream. Returns None if unavailable."""
+    try:
+        from poly.ws import MarketStream
+        stream = MarketStream(token_id, condition_id)
+        stream.start()
+        # Give it a moment to connect
+        time.sleep(1)
+        return stream
+    except Exception:
+        return None
 
 
 def _print(msg: str) -> None:
@@ -299,11 +364,16 @@ def run_bot(
     print("=" * 72)
     print(f"  POLY AUTOBOT ({mode}) — {order_type}")
     print(f"  Bankroll: ${state.bankroll:,.2f}  |  Kelly: {kelly_mult:.0%}  |  Edge: {edge_threshold:.0%}{stoploss_str}")
+    if _tg_configured():
+        print(f"  Telegram: ON")
     print(f"  Started: {state.started_at}")
     if state.total_trades > 0:
         print(f"  Trades: {state.total_trades}  |  WR: {state.win_rate:.1%}  |  P&L: ${state.total_pnl:+,.2f}")
     print("=" * 72)
     print()
+
+    # Notify startup
+    notify_startup(mode, order_type, state.bankroll, kelly_mult, edge_threshold, enable_stoploss)
 
     # Bootstrap recent outcomes if we don't have them
     if not state.recent_outcomes:
@@ -314,6 +384,9 @@ def run_bot(
         else:
             _print("  No recent outcomes (will use base rate)")
 
+    # Daily summary tracking
+    last_daily_summary = 0
+
     # Main loop
     while not shutdown:
         try:
@@ -322,14 +395,23 @@ def run_bot(
                 place_order_fn, sell_fn, use_maker, enable_stoploss,
             )
             state.save()
+
+            # Send daily summary at ~00:00 UTC
+            now_ts = int(time.time())
+            today_midnight = (now_ts // 86400) * 86400
+            if today_midnight > last_daily_summary:
+                send_daily_summary()
+                last_daily_summary = today_midnight
         except KeyboardInterrupt:
             break
         except Exception as e:
             _print(f"ERROR: {e}")
+            notify_error(str(e))
             time.sleep(30)  # back off on errors
 
     # Final save
     state.save()
+    notify_shutdown(state.bankroll, state.total_trades, state.win_rate, state.total_pnl, state.max_drawdown)
     print()
     print("=" * 72)
     print(f"  BOT STOPPED — {_now_utc()}")
@@ -349,7 +431,7 @@ def _run_one_cycle(
     use_maker: bool,
     enable_stoploss: bool,
 ) -> None:
-    """Run a single trade cycle: wait → evaluate → trade → monitor → resolve."""
+    """Run a single trade cycle: wait → book → evaluate → trade → verify → monitor → resolve."""
 
     # Determine the next window to trade
     next_ts = _next_window_ts()
@@ -366,16 +448,37 @@ def _run_one_cycle(
     if now < target_time:
         wait_secs = target_time - now
         _print(f"Next window: {next_dt.strftime('%H:%M:%S UTC')}  (waiting {wait_secs:.0f}s)")
-        # Sleep in small chunks so we can respond to shutdown
         while time.time() < target_time:
             time.sleep(min(5.0, target_time - time.time()))
 
-    # Evaluate signal: use maker or taker pricing
-    model_up = conditional_prob_up(state.recent_outcomes)
+    # Fetch market for token IDs and live book
+    market = _fetch_5m_market(next_ts)
+    up_token_id = None
+    condition_id = None
+    live_bid = 0.0
+    live_ask = 0.0
+
+    if market and market.is_tradeable:
+        up_token_id = market.up_token_id
+        condition_id = market.condition_id
+
+        # Fetch live book prices instead of using hardcoded constants
+        book = fetch_live_book(up_token_id)
+        if book and book.is_valid:
+            live_bid = book.best_bid
+            live_ask = book.best_ask
+            _print(f"  Book: bid={live_bid:.3f} ({book.bid_size:.0f} shares)  ask={live_ask:.3f} ({book.ask_size:.0f} shares)  spread={book.spread:.3f}")
+        else:
+            _print(f"  Book unavailable, using defaults")
+
+    # Determine buy price: live book > fallback constants
     if use_maker:
-        buy_price = MAKER_BUY_PRICE  # 0.500 (bid, $0 fee)
+        buy_price = live_bid if live_bid > 0 else MAKER_BUY_PRICE
     else:
-        buy_price = DEFAULT_BUY_PRICE  # 0.510 (ask, 1.56% fee)
+        buy_price = live_ask if live_ask > 0 else DEFAULT_BUY_PRICE
+
+    # Evaluate signal
+    model_up = conditional_prob_up(state.recent_outcomes)
     edge = model_up - buy_price
 
     down_streak = 0
@@ -388,7 +491,7 @@ def _run_one_cycle(
     order_label = "MAKER" if use_maker else "TAKER"
     _print(
         f"Window {next_dt.strftime('%H:%M')}  |  "
-        f"P(Up)={model_up:.1%}  |  Edge={edge:+.1%} ({order_label})  |  "
+        f"P(Up)={model_up:.1%}  |  Buy={buy_price:.3f}  |  Edge={edge:+.1%} ({order_label})  |  "
         f"Prev: {' '.join(state.recent_outcomes[-3:])}  |  "
         f"Down streak: {down_streak}"
     )
@@ -399,7 +502,7 @@ def _run_one_cycle(
         _wait_and_update_outcomes(state, next_ts)
         return
 
-    # Size the bet
+    # Size the bet using live price
     net_odds = net_odds_after_fees(buy_price, is_maker=use_maker)
     kf = kelly_fraction(model_up, net_odds, kelly_mult)
     cap = state.bankroll * max_bet_pct
@@ -412,19 +515,31 @@ def _run_one_cycle(
 
     _print(f"  >>> BUY UP ({order_label})  |  Bet: ${bet_size:.2f}  |  Kelly: {kf:.1%}  |  Bank: ${state.bankroll:.2f}")
 
-    # Fetch market for token IDs (needed for maker orders and stop-loss)
-    up_token_id = None
+    # Telegram: trade placed
+    window_time = datetime.fromtimestamp(next_ts, tz=timezone.utc).strftime("%H:%M UTC")
+    notify_trade_placed(
+        window_time=window_time, side="BUY UP", order_type=order_label,
+        bet_size=bet_size, buy_price=buy_price, model_prob=model_up,
+        edge=edge, bankroll=state.bankroll, down_streak=down_streak,
+    )
+
+    # Place order and verify fill
+    shares_requested = bet_size / buy_price
+    actual_shares = shares_requested  # will be updated by fill verification
+    actual_bet = bet_size  # will be updated by fill verification
+    fill_fraction = 1.0
+    order_id = None
+
     if place_order_fn and not state.dry_run:
-        market = _fetch_5m_market(next_ts)
-        if market and market.is_tradeable:
-            up_token_id = market.up_token_id
+        if not market or not market.is_tradeable:
+            _print("  Market not found or not tradeable. Simulating.")
+        else:
             if use_maker:
-                # Maker: post-only limit buy at bid price
-                shares = bet_size / buy_price
+                # Maker: post-only limit buy at live bid price
                 result = place_order_fn(
                     token_id=up_token_id,
                     price=buy_price,
-                    size=round(shares, 2),
+                    size=round(shares_requested, 2),
                     side="BUY",
                 )
             else:
@@ -435,35 +550,78 @@ def _run_one_cycle(
                 sig = evaluate_5m_market(market, snap, edge_threshold, state.recent_outcomes)
                 result = place_order_fn(sig, market, bet_size)
 
-            if result.success:
-                _print(f"  ORDER PLACED: {result.order_id}")
-            else:
+            if not result.success:
                 _print(f"  ORDER FAILED: {result.error}")
                 _wait_and_update_outcomes(state, next_ts)
                 return
-        else:
-            _print("  Market not found or not tradeable. Simulating.")
+
+            order_id = result.order_id
+            _print(f"  ORDER PLACED: {order_id}")
+
+            # Fill verification for maker orders
+            if use_maker and order_id:
+                from poly.execute import wait_for_fill
+                # Wait up to ORDER_LEAD_TIME for fill, then cancel unfilled
+                fill_timeout = max(ORDER_LEAD_TIME - 5, 10)
+                _print(f"    Waiting up to {fill_timeout}s for fill...")
+                fill_status = wait_for_fill(
+                    order_id,
+                    timeout=fill_timeout,
+                    poll_interval=2.0,
+                    cancel_on_timeout=True,
+                )
+
+                if fill_status is None:
+                    _print(f"    Could not verify fill status. Assuming no fill.")
+                    _wait_and_update_outcomes(state, next_ts)
+                    return
+
+                actual_shares = fill_status.size_matched
+                fill_fraction = fill_status.fill_fraction
+
+                if actual_shares <= 0:
+                    _print(f"    No fill — order {fill_status.status}. Skipping trade.")
+                    _wait_and_update_outcomes(state, next_ts)
+                    return
+
+                actual_bet = actual_shares * buy_price
+                if fill_status.is_fully_filled:
+                    _print(f"    FILLED: {actual_shares:.1f} shares (100%)")
+                else:
+                    _print(
+                        f"    PARTIAL FILL: {actual_shares:.1f}/{shares_requested:.1f} shares "
+                        f"({fill_fraction:.0%}) — unfilled portion canceled"
+                    )
+                    # Adjust bet_size to actual filled amount
+                    bet_size = actual_bet
+
+                notify_fill(order_id, actual_shares, shares_requested, fill_fraction)
     else:
         _print(f"  [DRY RUN] Would place ${bet_size:.2f} on BUY UP ({order_label})")
 
     # Stop-loss monitoring during live window
     stopped_out = False
     stoploss_result = None
-    if enable_stoploss and up_token_id:
+    if enable_stoploss and up_token_id and actual_shares > 0:
         _print(f"    Monitoring stop-loss (sell if Up < {STOP_LOSS_PRICE:.0%})...")
         stoploss_result = _monitor_stoploss(
-            next_ts, up_token_id, bet_size, buy_price, state, sell_fn
+            next_ts, up_token_id, actual_shares, buy_price, bet_size,
+            dry_run=state.dry_run, condition_id=condition_id,
         )
         if stoploss_result and stoploss_result.get("stopped"):
             stopped_out = True
 
     if stopped_out:
-        # Stop-loss was triggered — P&L already computed
         pnl = stoploss_result["pnl"]
-        recovery = stoploss_result["recovery_pct"]
         state.total_stopouts += 1
         won = False
         outcome_label = "STOP-LOSS"
+        notify_stoploss(
+            window_time=window_time,
+            exit_price=stoploss_result.get("exit_price", 0),
+            pnl=pnl,
+            recovery_pct=stoploss_result.get("recovery_pct", 0),
+        )
     else:
         # Wait for resolution
         outcome = _wait_for_resolution(next_ts)
@@ -472,7 +630,7 @@ def _run_one_cycle(
             state.last_window_ts = next_ts
             return
 
-        # Calculate P&L
+        # Calculate P&L using actual fill size
         won = outcome == "Up"
         if won:
             pnl = bet_size * net_odds
@@ -497,7 +655,6 @@ def _run_one_cycle(
         if len(state.recent_outcomes) > 5:
             state.recent_outcomes.pop(0)
     else:
-        # Even after stop-loss, wait for actual outcome to update model
         actual_outcome = _wait_for_resolution(next_ts)
         if actual_outcome:
             state.recent_outcomes.append(actual_outcome)
@@ -506,7 +663,7 @@ def _run_one_cycle(
 
     state.last_window_ts = next_ts
 
-    # Log
+    # Log with fill details
     result_str = "WIN" if won else ("STOP" if stopped_out else "LOSS")
     _print(
         f"  {result_str}: {outcome_label}  |  PnL: ${pnl:+.2f}  |  "
@@ -515,14 +672,28 @@ def _run_one_cycle(
         f"DD: {dd:.1%}"
     )
 
+    # Telegram: outcome
+    notify_outcome(
+        window_time=window_time, outcome=outcome_label, won=won,
+        pnl=pnl, bankroll=state.bankroll, win_rate=state.win_rate,
+        total_trades=state.total_trades, drawdown=dd, stopped_out=stopped_out,
+    )
+
     _log_trade({
         "ts": next_ts,
         "time": datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat(),
         "side": "BUY UP",
         "order_type": "MAKER" if use_maker else "TAKER",
+        "order_id": order_id,
         "model_p": model_up,
+        "buy_price": buy_price,
+        "live_bid": live_bid,
+        "live_ask": live_ask,
         "edge": edge,
         "bet": bet_size,
+        "shares_requested": round(shares_requested, 2),
+        "shares_filled": round(actual_shares, 2),
+        "fill_fraction": round(fill_fraction, 4),
         "outcome": outcome_label,
         "won": won,
         "stopped_out": stopped_out,

@@ -1,0 +1,22 @@
+[Unit]
+Description=Poly Bot Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=poly
+WorkingDirectory=/opt/poly
+ExecStart=/opt/poly/venv/bin/python -m poly.dashboard --port 8080
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/opt/poly/.env
+
+StandardOutput=append:/var/log/poly/dashboard.log
+StandardError=append:/var/log/poly/dashboard.log
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/poly /var/log/poly
+
+[Install]
+WantedBy=multi-user.target

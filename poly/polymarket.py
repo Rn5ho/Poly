@@ -226,3 +226,110 @@ def fetch_order_book(token_id: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+@dataclass
+class LiveBook:
+    """Snapshot of the live order book for a token."""
+
+    best_bid: float
+    best_ask: float
+    bid_size: float  # total shares at best bid
+    ask_size: float  # total shares at best ask
+    spread: float
+    midpoint: float
+
+    @property
+    def is_valid(self) -> bool:
+        return self.best_bid > 0 and self.best_ask > 0 and self.best_ask > self.best_bid
+
+
+def fetch_live_book(token_id: str) -> LiveBook | None:
+    """Fetch current best bid/ask from the CLOB order book.
+
+    Returns a LiveBook with live prices, or None on failure.
+    Use this instead of hardcoded price constants.
+    """
+    try:
+        book = fetch_order_book(token_id)
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+
+        if not bids or not asks:
+            return None
+
+        # Best bid = highest bid price, best ask = lowest ask price
+        best_bid_level = max(bids, key=lambda b: float(b["price"]))
+        best_ask_level = min(asks, key=lambda a: float(a["price"]))
+
+        best_bid = float(best_bid_level["price"])
+        best_ask = float(best_ask_level["price"])
+        bid_size = float(best_bid_level["size"])
+        ask_size = float(best_ask_level["size"])
+
+        return LiveBook(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            spread=best_ask - best_bid,
+            midpoint=(best_bid + best_ask) / 2,
+        )
+    except (requests.RequestException, ValueError, KeyError):
+        return None
+
+
+def fetch_midpoint(token_id: str) -> float | None:
+    """Fetch the midpoint price from the CLOB.
+
+    Uses GET /midpoint?token_id=<id> — single lightweight call.
+    Returns midpoint as float, or None on failure.
+    """
+    try:
+        resp = requests.get(
+            f"{CLOB_BASE}/midpoint",
+            params={"token_id": token_id},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        mid = float(data.get("mid", 0))
+        return mid if mid > 0 else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def fetch_price_history(
+    token_id: str,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    fidelity: int = 1,
+) -> list[dict]:
+    """Fetch historical price data for a token.
+
+    Uses GET /prices-history?market=<token_id>&startTs=X&endTs=Y&fidelity=N.
+    Returns list of {"t": unix_ts, "p": price} dicts.
+
+    Args:
+        token_id: CLOB token ID.
+        start_ts: Start of time range (unix seconds).
+        end_ts: End of time range (unix seconds).
+        fidelity: Resolution in minutes (1 = 1-minute candles).
+    """
+    try:
+        params: dict = {"market": token_id, "fidelity": fidelity}
+        if start_ts is not None:
+            params["startTs"] = start_ts
+        if end_ts is not None:
+            params["endTs"] = end_ts
+
+        resp = requests.get(
+            f"{CLOB_BASE}/prices-history",
+            params=params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("history", [])
+    except (requests.RequestException, ValueError):
+        return []
