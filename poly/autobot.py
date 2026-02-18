@@ -336,6 +336,7 @@ def run_bot(
 
     state.dry_run = dry_run
     state.use_maker = use_maker
+    state.save()  # Write initial state so dashboard has data immediately
     mode = "DRY RUN" if dry_run else "LIVE"
     order_type = "MAKER ($0 fee)" if use_maker else "TAKER (1.56% fee)"
     stoploss_str = f"  |  Stop-loss: {STOP_LOSS_PRICE:.0%}" if enable_stoploss else ""
