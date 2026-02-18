@@ -48,7 +48,12 @@ MIN_BET = 5.0  # Polymarket minimum
 # Maker orders: $0 fee (+ eligible for 20% rebate pool)
 FEE_RATE = 0.25  # 5-min crypto fee rate
 FEE_EXPONENT = 2  # 5-min crypto exponent (squared curve)
-DEFAULT_BUY_PRICE = 0.510  # typical ask price (bid=0.50, ask=0.51, mid=0.505)
+DEFAULT_BUY_PRICE = 0.510  # typical ask price for taker orders
+MAKER_BUY_PRICE = 0.500  # typical bid price for maker orders (resting on book)
+
+# Stop-loss / cash-out thresholds
+STOP_LOSS_PRICE = 0.30  # sell Up shares if price drops below 30c during window
+STOP_LOSS_ENABLED = True  # enable stop-loss monitoring during live windows
 
 
 def taker_fee_rate(price: float) -> float:
@@ -106,6 +111,9 @@ class Signal:
     in_progress: bool = False
     seconds_remaining: float = 0.0
     prev_outcome: str = ""  # most recent resolved outcome
+    # Maker-specific fields
+    maker_ev: float = 0.0  # EV using maker pricing ($0 fee, bid price)
+    maker_kelly: float = 0.0  # Kelly fraction for maker orders
 
 
 def conditional_prob_up(prev_outcomes: list[str]) -> float:
@@ -238,12 +246,21 @@ def evaluate_5m_market(
         buy_price = 0.5
         ev = 0.0
 
-    # Kelly sizing
+    # Kelly sizing (taker)
     if buy_price > 0 and buy_price < 1 and side != "NO EDGE":
         net_odds = (1.0 - buy_price) / buy_price
         kf = kelly_fraction(win_prob, net_odds)
     else:
         kf = 0.0
+
+    # Maker pricing: buy at bid (50c), $0 fee, better odds
+    maker_ev = 0.0
+    maker_kf = 0.0
+    if side != "NO EDGE":
+        maker_price = market.best_bid if market.best_bid > 0 else MAKER_BUY_PRICE
+        maker_odds = net_odds_after_fees(maker_price, is_maker=True)
+        maker_ev = (model_up / maker_price - 1) if maker_price > 0 else 0
+        maker_kf = kelly_fraction(win_prob, maker_odds)
 
     prev_str = prev_outcomes[-1] if prev_outcomes else ""
 
@@ -270,4 +287,6 @@ def evaluate_5m_market(
         in_progress=is_live,
         seconds_remaining=secs_remaining,
         prev_outcome=prev_str,
+        maker_ev=maker_ev,
+        maker_kelly=maker_kf,
     )

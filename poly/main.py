@@ -96,12 +96,14 @@ def backtest(
     edge_threshold: float = 0.03,
     bankroll: float = 100.0,
     max_bet: float = 0.0,
+    as_maker: bool = False,
 ) -> None:
     """Run backtest against resolved markets."""
     from poly.backtest import print_backtest, run_backtest
 
+    order_type = "MAKER ($0 fee)" if as_maker else "TAKER (1.56% fee)"
     print("=" * 72)
-    print(f"  BACKTEST — Last {hours} hours  |  Starting bankroll: ${bankroll:,.2f}")
+    print(f"  BACKTEST — Last {hours} hours  |  ${bankroll:,.2f}  |  {order_type}")
     print("=" * 72)
     print()
 
@@ -110,6 +112,7 @@ def backtest(
         edge_threshold=edge_threshold,
         bankroll=bankroll,
         max_bet=max_bet,
+        as_maker=as_maker,
     )
     print_backtest(result)
 
@@ -263,6 +266,7 @@ def main():
     p_bt.add_argument("-e", "--edge", type=float, default=0.03)
     p_bt.add_argument("-b", "--bankroll", type=float, default=100.0, help="Starting bankroll (default $100)")
     p_bt.add_argument("-m", "--max-bet", type=float, default=0.0, help="Max bet per trade (default: 10%% of bankroll)")
+    p_bt.add_argument("--maker", action="store_true", help="Simulate as maker ($0 fee, buy at bid)")
 
     # trade
     p_trade = sub.add_parser("trade", help="Live trading (or dry run)")
@@ -279,6 +283,9 @@ def main():
     p_auto.add_argument("--max-bet-pct", type=float, default=0.10, help="Max bet as %% of bankroll")
     p_auto.add_argument("--live", action="store_true", help="Place real orders (default: dry run)")
     p_auto.add_argument("--fresh", action="store_true", help="Start fresh (ignore saved state)")
+    p_auto.add_argument("--maker", action="store_true", help="Use maker orders ($0 fee, recommended)")
+    p_auto.add_argument("--taker", action="store_true", help="Use taker orders (1.56% fee)")
+    p_auto.add_argument("--stoploss", action="store_true", help="Enable stop-loss during live windows")
 
     args = parser.parse_args()
 
@@ -293,6 +300,7 @@ def main():
                 edge_threshold=args.edge,
                 bankroll=args.bankroll,
                 max_bet=args.max_bet,
+                as_maker=getattr(args, 'maker', False),
             )
         elif args.command == "trade":
             trade(
@@ -304,6 +312,7 @@ def main():
         elif args.command == "autobot":
             from poly.autobot import run_bot
 
+            use_maker = args.maker or not args.taker
             run_bot(
                 bankroll=args.bankroll,
                 edge_threshold=args.edge,
@@ -311,6 +320,8 @@ def main():
                 kelly_mult=args.kelly,
                 dry_run=not args.live,
                 resume=not args.fresh,
+                use_maker=use_maker,
+                enable_stoploss=args.stoploss,
             )
         else:
             # Default: scan

@@ -61,6 +61,7 @@ def run_backtest(
     bankroll: float = 100.0,
     max_bet: float = 0.0,  # 0 = auto (10% of bankroll)
     workers: int = 20,
+    as_maker: bool = False,
 ) -> BacktestResult:
     """Run a backtest over the last N hours of resolved 5-minute markets.
 
@@ -70,7 +71,7 @@ def run_backtest(
     3. Size bet via Kelly criterion on current bankroll
     4. Track bankroll evolution
     """
-    from poly.model import conditional_prob_up, kelly_fraction as calc_kelly, net_odds_after_fees, DEFAULT_BUY_PRICE
+    from poly.model import conditional_prob_up, kelly_fraction as calc_kelly, net_odds_after_fees, DEFAULT_BUY_PRICE, MAKER_BUY_PRICE
 
     starting_bankroll = bankroll
     current_bankroll = bankroll
@@ -129,8 +130,8 @@ def run_backtest(
         # Conditional model: P(Up) based on previous outcomes
         model_up = conditional_prob_up(recent_outcomes)
 
-        # Market pricing: taker buys at ask (~0.510), edge computed vs ask
-        buy_price = DEFAULT_BUY_PRICE  # 0.510 (typical ask)
+        # Market pricing: taker buys at ask (~0.510), maker at bid (~0.500)
+        buy_price = MAKER_BUY_PRICE if as_maker else DEFAULT_BUY_PRICE
         market_up = buy_price
         edge = model_up - market_up
 
@@ -155,7 +156,7 @@ def run_backtest(
         kf = 0.0
         pnl = 0.0
         if side != "NO EDGE" and current_bankroll > 5.0:
-            net_odds = net_odds_after_fees(buy_price, is_maker=False)
+            net_odds = net_odds_after_fees(buy_price, is_maker=as_maker)
             kf = calc_kelly(win_prob, net_odds)
             cap = max_bet if max_bet > 0 else current_bankroll * 0.10
             bet_size = min(current_bankroll * kf, cap, current_bankroll)

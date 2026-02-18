@@ -4,18 +4,24 @@ Runs continuously, placing trades every 5-minute window based on
 the conditional mean-reversion model. Tracks its own bankroll,
 trade history, and performance metrics.
 
+Execution modes:
+  --maker     Use maker (post-only) limit orders at bid ($0 fee)
+  --taker     Use taker market orders at ask (1.56% fee, default)
+  --stoploss  Enable stop-loss monitoring during live windows
+
 Usage:
   python -m poly.autobot                       # dry run, $500 bankroll
   python -m poly.autobot --bankroll 1000       # dry run, $1000
-  python -m poly.autobot --live                # REAL trading
-  python -m poly.autobot --live --bankroll 500 # REAL, $500
+  python -m poly.autobot --live --maker        # REAL, maker orders (recommended)
+  python -m poly.autobot --live --stoploss     # REAL, with stop-loss
 
 The bot:
 1. Waits for each 5-minute window boundary
 2. Fetches the most recent resolved outcomes
 3. Computes conditional P(Up) using graduated Down-streak model
 4. If edge > threshold, sizes a quarter-Kelly bet and places it
-5. Waits for resolution, updates bankroll, repeats
+5. Optionally: monitors live window for stop-loss (sell if Up < 30c)
+6. Waits for resolution, updates bankroll, repeats
 """
 
 import json
@@ -31,8 +37,10 @@ from poly.model import (
     DEFAULT_BUY_PRICE,
     DEFAULT_EDGE_THRESHOLD,
     KELLY_MULTIPLIER,
+    MAKER_BUY_PRICE,
     MAX_BET_PCT,
     MIN_BET,
+    STOP_LOSS_PRICE,
     conditional_prob_up,
     kelly_fraction,
     net_odds_after_fees,
@@ -41,6 +49,7 @@ from poly.polymarket import (
     WINDOW_SECONDS,
     _fetch_5m_market,
     _fetch_resolved_outcome,
+    fetch_order_book,
     fetch_recent_outcomes,
 )
 
@@ -52,6 +61,8 @@ RESOLUTION_WAIT = 60
 RESOLUTION_POLL = 10
 # Max time to wait for resolution before giving up
 RESOLUTION_TIMEOUT = 300
+# How often to check price during stop-loss monitoring
+STOPLOSS_POLL = 5
 
 STATE_FILE = Path("poly_bot_state.json")
 LOG_FILE = Path("poly_bot_log.jsonl")
@@ -66,12 +77,14 @@ class BotState:
     peak_bankroll: float = 500.0
     total_trades: int = 0
     total_wins: int = 0
+    total_stopouts: int = 0
     total_pnl: float = 0.0
     max_drawdown: float = 0.0
     recent_outcomes: list[str] = field(default_factory=list)
     last_window_ts: int = 0
     started_at: str = ""
     dry_run: bool = True
+    use_maker: bool = False
 
     @property
     def win_rate(self) -> float:
@@ -90,6 +103,9 @@ class BotState:
     def load(cls) -> "BotState":
         if STATE_FILE.exists():
             data = json.loads(STATE_FILE.read_text())
+            # Handle legacy state files missing new fields
+            valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+            data = {k: v for k, v in data.items() if k in valid_fields}
             return cls(**data)
         return cls()
 
@@ -140,6 +156,77 @@ def _wait_for_resolution(window_ts: int) -> str | None:
     return None
 
 
+def _get_up_price_from_clob(token_id: str) -> float | None:
+    """Get current best bid for Up token from CLOB order book."""
+    try:
+        book = fetch_order_book(token_id)
+        bids = book.get("bids", [])
+        if bids:
+            # Best bid is the highest price
+            return max(float(b["price"]) for b in bids)
+        return None
+    except Exception:
+        return None
+
+
+def _monitor_stoploss(
+    window_ts: int,
+    up_token_id: str,
+    bet_size: float,
+    buy_price: float,
+    state: BotState,
+    sell_fn=None,
+) -> dict | None:
+    """Monitor live window for stop-loss trigger.
+
+    Polls the Up token price every STOPLOSS_POLL seconds.
+    If Up price drops below STOP_LOSS_PRICE, sells to limit losses.
+
+    Returns:
+        dict with stop-loss details if triggered, None otherwise.
+    """
+    window_end = window_ts + WINDOW_SECONDS
+    shares_held = bet_size / buy_price  # approximate shares
+
+    while time.time() < window_end - 10:  # stop monitoring 10s before end
+        current_price = _get_up_price_from_clob(up_token_id)
+
+        if current_price is not None and current_price < STOP_LOSS_PRICE:
+            _print(
+                f"    STOP-LOSS TRIGGERED: Up={current_price:.2f} < {STOP_LOSS_PRICE:.2f}"
+            )
+
+            # Execute sell (or simulate)
+            if sell_fn and not state.dry_run:
+                from poly.execute import sell_shares
+                result = sell_shares(
+                    up_token_id, shares_held, price=current_price, as_maker=False
+                )
+                if result.success:
+                    _print(f"    SOLD: {result.order_id}")
+                else:
+                    _print(f"    SELL FAILED: {result.error}")
+                    return None
+            else:
+                _print(
+                    f"    [DRY RUN] Would sell {shares_held:.1f} shares at {current_price:.2f}"
+                )
+
+            # Calculate stop-loss P&L
+            recovery = shares_held * current_price
+            pnl = recovery - bet_size
+            return {
+                "stopped": True,
+                "exit_price": current_price,
+                "pnl": pnl,
+                "recovery_pct": recovery / bet_size,
+            }
+
+        time.sleep(STOPLOSS_POLL)
+
+    return None  # no stop-loss triggered
+
+
 def _print(msg: str) -> None:
     """Print with timestamp."""
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -153,6 +240,8 @@ def run_bot(
     kelly_mult: float = KELLY_MULTIPLIER,
     dry_run: bool = True,
     resume: bool = True,
+    use_maker: bool = False,
+    enable_stoploss: bool = False,
 ) -> None:
     """Run the automated trading bot.
 
@@ -163,6 +252,8 @@ def run_bot(
         kelly_mult: Kelly multiplier (default 0.25 = quarter-Kelly).
         dry_run: If True, simulate trades without placing orders.
         resume: If True, resume from saved state.
+        use_maker: If True, use maker (post-only) limit orders ($0 fee).
+        enable_stoploss: If True, monitor live windows for stop-loss.
     """
     # Initialize or resume state
     if resume and STATE_FILE.exists():
@@ -175,16 +266,22 @@ def run_bot(
             peak_bankroll=bankroll,
             started_at=_now_utc(),
             dry_run=dry_run,
+            use_maker=use_maker,
         )
 
     state.dry_run = dry_run
+    state.use_maker = use_maker
     mode = "DRY RUN" if dry_run else "LIVE"
+    order_type = "MAKER ($0 fee)" if use_maker else "TAKER (1.56% fee)"
+    stoploss_str = f"  |  Stop-loss: {STOP_LOSS_PRICE:.0%}" if enable_stoploss else ""
 
     # Lazy import for live trading
-    place_order = None
+    place_order_fn = None
+    sell_fn = None
     if not dry_run:
-        from poly.execute import place_market_order
-        place_order = place_market_order
+        from poly.execute import place_maker_order, place_market_order, sell_shares
+        place_order_fn = place_maker_order if use_maker else place_market_order
+        sell_fn = sell_shares
 
     # Handle graceful shutdown
     shutdown = False
@@ -200,8 +297,8 @@ def run_bot(
     # Print banner
     print()
     print("=" * 72)
-    print(f"  POLY AUTOBOT ({mode})")
-    print(f"  Bankroll: ${state.bankroll:,.2f}  |  Kelly: {kelly_mult:.0%}  |  Edge: {edge_threshold:.0%}")
+    print(f"  POLY AUTOBOT ({mode}) — {order_type}")
+    print(f"  Bankroll: ${state.bankroll:,.2f}  |  Kelly: {kelly_mult:.0%}  |  Edge: {edge_threshold:.0%}{stoploss_str}")
     print(f"  Started: {state.started_at}")
     if state.total_trades > 0:
         print(f"  Trades: {state.total_trades}  |  WR: {state.win_rate:.1%}  |  P&L: ${state.total_pnl:+,.2f}")
@@ -220,7 +317,10 @@ def run_bot(
     # Main loop
     while not shutdown:
         try:
-            _run_one_cycle(state, edge_threshold, max_bet_pct, kelly_mult, place_order)
+            _run_one_cycle(
+                state, edge_threshold, max_bet_pct, kelly_mult,
+                place_order_fn, sell_fn, use_maker, enable_stoploss,
+            )
             state.save()
         except KeyboardInterrupt:
             break
@@ -234,7 +334,7 @@ def run_bot(
     print("=" * 72)
     print(f"  BOT STOPPED — {_now_utc()}")
     print(f"  Bankroll: ${state.bankroll:,.2f}  |  Trades: {state.total_trades}  |  WR: {state.win_rate:.1%}")
-    print(f"  P&L: ${state.total_pnl:+,.2f}  |  Max DD: {state.max_drawdown:.1%}")
+    print(f"  P&L: ${state.total_pnl:+,.2f}  |  Max DD: {state.max_drawdown:.1%}  |  Stopouts: {state.total_stopouts}")
     print("=" * 72)
     print()
 
@@ -244,9 +344,12 @@ def _run_one_cycle(
     edge_threshold: float,
     max_bet_pct: float,
     kelly_mult: float,
-    place_order,
+    place_order_fn,
+    sell_fn,
+    use_maker: bool,
+    enable_stoploss: bool,
 ) -> None:
-    """Run a single trade cycle: wait → evaluate → trade → resolve."""
+    """Run a single trade cycle: wait → evaluate → trade → monitor → resolve."""
 
     # Determine the next window to trade
     next_ts = _next_window_ts()
@@ -267,9 +370,12 @@ def _run_one_cycle(
         while time.time() < target_time:
             time.sleep(min(5.0, target_time - time.time()))
 
-    # Evaluate signal (edge computed vs actual buy price including spread)
+    # Evaluate signal: use maker or taker pricing
     model_up = conditional_prob_up(state.recent_outcomes)
-    buy_price = DEFAULT_BUY_PRICE  # 0.510 (typical ask)
+    if use_maker:
+        buy_price = MAKER_BUY_PRICE  # 0.500 (bid, $0 fee)
+    else:
+        buy_price = DEFAULT_BUY_PRICE  # 0.510 (ask, 1.56% fee)
     edge = model_up - buy_price
 
     down_streak = 0
@@ -279,9 +385,10 @@ def _run_one_cycle(
         else:
             break
 
+    order_label = "MAKER" if use_maker else "TAKER"
     _print(
         f"Window {next_dt.strftime('%H:%M')}  |  "
-        f"P(Up)={model_up:.1%}  |  Edge={edge:+.1%}  |  "
+        f"P(Up)={model_up:.1%}  |  Edge={edge:+.1%} ({order_label})  |  "
         f"Prev: {' '.join(state.recent_outcomes[-3:])}  |  "
         f"Down streak: {down_streak}"
     )
@@ -289,12 +396,11 @@ def _run_one_cycle(
     # Decide whether to trade
     if edge <= edge_threshold:
         _print(f"  No edge ({edge:+.1%} < {edge_threshold:.0%}). Skipping.")
-        # Still need to wait for resolution to update outcomes
         _wait_and_update_outcomes(state, next_ts)
         return
 
-    # Size the bet (fee-aware odds)
-    net_odds = net_odds_after_fees(buy_price, is_maker=False)
+    # Size the bet
+    net_odds = net_odds_after_fees(buy_price, is_maker=use_maker)
     kf = kelly_fraction(model_up, net_odds, kelly_mult)
     cap = state.bankroll * max_bet_pct
     bet_size = min(state.bankroll * kf, cap, state.bankroll)
@@ -304,18 +410,31 @@ def _run_one_cycle(
         _wait_and_update_outcomes(state, next_ts)
         return
 
-    _print(f"  >>> BUY UP  |  Bet: ${bet_size:.2f}  |  Kelly: {kf:.1%}  |  Bank: ${state.bankroll:.2f}")
+    _print(f"  >>> BUY UP ({order_label})  |  Bet: ${bet_size:.2f}  |  Kelly: {kf:.1%}  |  Bank: ${state.bankroll:.2f}")
 
-    # Place order (or simulate)
-    if place_order and not state.dry_run:
+    # Fetch market for token IDs (needed for maker orders and stop-loss)
+    up_token_id = None
+    if place_order_fn and not state.dry_run:
         market = _fetch_5m_market(next_ts)
         if market and market.is_tradeable:
-            from poly.model import evaluate_5m_market
-            from poly.btc import get_snapshot
+            up_token_id = market.up_token_id
+            if use_maker:
+                # Maker: post-only limit buy at bid price
+                shares = bet_size / buy_price
+                result = place_order_fn(
+                    token_id=up_token_id,
+                    price=buy_price,
+                    size=round(shares, 2),
+                    side="BUY",
+                )
+            else:
+                # Taker: market order
+                from poly.model import evaluate_5m_market
+                from poly.btc import get_snapshot
+                snap = get_snapshot()
+                sig = evaluate_5m_market(market, snap, edge_threshold, state.recent_outcomes)
+                result = place_order_fn(sig, market, bet_size)
 
-            snap = get_snapshot()
-            sig = evaluate_5m_market(market, snap, edge_threshold, state.recent_outcomes)
-            result = place_order(sig, market, bet_size)
             if result.success:
                 _print(f"  ORDER PLACED: {result.order_id}")
             else:
@@ -325,21 +444,41 @@ def _run_one_cycle(
         else:
             _print("  Market not found or not tradeable. Simulating.")
     else:
-        _print(f"  [DRY RUN] Would place ${bet_size:.2f} on BUY UP")
+        _print(f"  [DRY RUN] Would place ${bet_size:.2f} on BUY UP ({order_label})")
 
-    # Wait for resolution
-    outcome = _wait_for_resolution(next_ts)
-    if not outcome:
-        _print("  Resolution timeout! Skipping this window.")
-        state.last_window_ts = next_ts
-        return
+    # Stop-loss monitoring during live window
+    stopped_out = False
+    stoploss_result = None
+    if enable_stoploss and up_token_id:
+        _print(f"    Monitoring stop-loss (sell if Up < {STOP_LOSS_PRICE:.0%})...")
+        stoploss_result = _monitor_stoploss(
+            next_ts, up_token_id, bet_size, buy_price, state, sell_fn
+        )
+        if stoploss_result and stoploss_result.get("stopped"):
+            stopped_out = True
 
-    # Calculate P&L
-    won = outcome == "Up"
-    if won:
-        pnl = bet_size * net_odds
+    if stopped_out:
+        # Stop-loss was triggered — P&L already computed
+        pnl = stoploss_result["pnl"]
+        recovery = stoploss_result["recovery_pct"]
+        state.total_stopouts += 1
+        won = False
+        outcome_label = "STOP-LOSS"
     else:
-        pnl = -bet_size
+        # Wait for resolution
+        outcome = _wait_for_resolution(next_ts)
+        if not outcome:
+            _print("  Resolution timeout! Skipping this window.")
+            state.last_window_ts = next_ts
+            return
+
+        # Calculate P&L
+        won = outcome == "Up"
+        if won:
+            pnl = bet_size * net_odds
+        else:
+            pnl = -bet_size
+        outcome_label = outcome
 
     state.bankroll += pnl
     state.total_pnl += pnl
@@ -352,17 +491,25 @@ def _run_one_cycle(
     if dd > state.max_drawdown:
         state.max_drawdown = dd
 
-    # Update outcome history
-    state.recent_outcomes.append(outcome)
-    if len(state.recent_outcomes) > 5:
-        state.recent_outcomes.pop(0)
+    # Update outcome history (always need actual outcome for conditional model)
+    if not stopped_out:
+        state.recent_outcomes.append(outcome)
+        if len(state.recent_outcomes) > 5:
+            state.recent_outcomes.pop(0)
+    else:
+        # Even after stop-loss, wait for actual outcome to update model
+        actual_outcome = _wait_for_resolution(next_ts)
+        if actual_outcome:
+            state.recent_outcomes.append(actual_outcome)
+            if len(state.recent_outcomes) > 5:
+                state.recent_outcomes.pop(0)
+
     state.last_window_ts = next_ts
 
     # Log
-    result_str = "WIN" if won else "LOSS"
-    emoji = "+" if won else "-"
+    result_str = "WIN" if won else ("STOP" if stopped_out else "LOSS")
     _print(
-        f"  {result_str}: {outcome}  |  PnL: ${pnl:+.2f}  |  "
+        f"  {result_str}: {outcome_label}  |  PnL: ${pnl:+.2f}  |  "
         f"Bank: ${state.bankroll:.2f}  |  "
         f"WR: {state.win_rate:.1%} ({state.total_wins}/{state.total_trades})  |  "
         f"DD: {dd:.1%}"
@@ -372,11 +519,13 @@ def _run_one_cycle(
         "ts": next_ts,
         "time": datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat(),
         "side": "BUY UP",
+        "order_type": "MAKER" if use_maker else "TAKER",
         "model_p": model_up,
         "edge": edge,
         "bet": bet_size,
-        "outcome": outcome,
+        "outcome": outcome_label,
         "won": won,
+        "stopped_out": stopped_out,
         "pnl": pnl,
         "bankroll": state.bankroll,
         "win_rate": state.win_rate,
@@ -408,7 +557,13 @@ def main():
     parser.add_argument("--max-bet-pct", type=float, default=MAX_BET_PCT, help="Max bet as %% of bankroll (default 0.10)")
     parser.add_argument("--live", action="store_true", help="Place real orders (default: dry run)")
     parser.add_argument("--fresh", action="store_true", help="Start fresh (ignore saved state)")
+    parser.add_argument("--maker", action="store_true", help="Use maker orders ($0 fee, recommended)")
+    parser.add_argument("--taker", action="store_true", help="Use taker orders (1.56% fee)")
+    parser.add_argument("--stoploss", action="store_true", help="Enable stop-loss monitoring during live windows")
     args = parser.parse_args()
+
+    # Default to maker if neither specified
+    use_maker = args.maker or not args.taker
 
     run_bot(
         bankroll=args.bankroll,
@@ -417,6 +572,8 @@ def main():
         kelly_mult=args.kelly,
         dry_run=not args.live,
         resume=not args.fresh,
+        use_maker=use_maker,
+        enable_stoploss=args.stoploss,
     )
 
 

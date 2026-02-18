@@ -3,6 +3,11 @@
 Uses the py-clob-client package for authenticated order placement.
 Requires a Polygon wallet private key and USDC balance.
 
+Supports:
+  - Maker (post-only) limit orders — $0 fee, eligible for 20% rebate
+  - Taker (FOK) market orders — 1.56% fee at p=0.50
+  - Sell orders — for cash-out / stop-loss during live windows
+
 Setup:
   pip install py-clob-client
   export POLY_PRIVATE_KEY="0x..."
@@ -63,6 +68,56 @@ def _get_client():
     )
     _client.set_api_creds(_client.create_or_derive_api_creds())
     return _client
+
+
+def place_maker_order(
+    token_id: str,
+    price: float,
+    size: float,
+    side: str = "BUY",
+) -> TradeResult:
+    """Place a maker (post-only) limit order. $0 fee + rebate eligible.
+
+    GTC order that rests on the book. If it would cross the spread
+    (immediately fill), it is rejected — guaranteeing maker status.
+
+    Args:
+        token_id: CLOB token ID for the outcome.
+        price: Limit price (e.g. 0.50 for Up at bid).
+        size: Number of shares.
+        side: "BUY" or "SELL".
+    """
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY, SELL
+
+    client = _get_client()
+    clob_side = BUY if side == "BUY" else SELL
+
+    try:
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=clob_side,
+        )
+        signed_order = client.create_order(order_args)
+        response = client.post_order(signed_order, OrderType.GTC)
+
+        return TradeResult(
+            success=True,
+            order_id=response.get("orderId"),
+            side=side,
+            token_id=token_id,
+            price=price,
+            size=size,
+            error=None,
+        )
+    except Exception as e:
+        return TradeResult(
+            success=False, order_id=None, side=side,
+            token_id=token_id, price=price, size=size,
+            error=str(e),
+        )
 
 
 def place_limit_order(
@@ -131,7 +186,7 @@ def place_market_order(
     market,  # FiveMinMarket
     amount_usd: float,
 ) -> TradeResult:
-    """Place a fill-or-kill market order.
+    """Place a fill-or-kill market order (taker, pays 1.56% fee).
 
     Args:
         signal: The trading signal.
@@ -178,6 +233,76 @@ def place_market_order(
             token_id=token_id, price=0, size=amount_usd,
             error=str(e),
         )
+
+
+def sell_shares(
+    token_id: str,
+    size: float,
+    price: float | None = None,
+    as_maker: bool = True,
+) -> TradeResult:
+    """Sell shares for cash-out or stop-loss.
+
+    Args:
+        token_id: CLOB token ID of shares to sell.
+        size: Number of shares to sell.
+        price: Limit price. If None, sells at market (FOK).
+        as_maker: If True, place as resting limit order ($0 fee).
+                  If False, sell as FOK market order (pays ~1.56% fee).
+    """
+    client = _get_client()
+
+    if price is not None and as_maker:
+        return place_maker_order(token_id, price, size, side="SELL")
+
+    # Market sell (taker)
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.order_builder.constants import SELL
+
+    try:
+        market_order = MarketOrderArgs(
+            token_id=token_id,
+            amount=size,
+            side=SELL,
+        )
+        signed_order = client.create_market_order(market_order)
+        response = client.post_order(signed_order, OrderType.FOK)
+
+        return TradeResult(
+            success=True,
+            order_id=response.get("orderId"),
+            side="SELL",
+            token_id=token_id,
+            price=price or 0,
+            size=size,
+            error=None,
+        )
+    except Exception as e:
+        return TradeResult(
+            success=False, order_id=None, side="SELL",
+            token_id=token_id, price=price or 0, size=size,
+            error=str(e),
+        )
+
+
+def cancel_order(order_id: str) -> bool:
+    """Cancel a resting order by ID. Returns True on success."""
+    client = _get_client()
+    try:
+        client.cancel(order_id)
+        return True
+    except Exception:
+        return False
+
+
+def cancel_all_orders() -> bool:
+    """Cancel all resting orders. Returns True on success."""
+    client = _get_client()
+    try:
+        client.cancel_all()
+        return True
+    except Exception:
+        return False
 
 
 def calculate_bet_size(
