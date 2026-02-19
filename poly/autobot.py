@@ -600,6 +600,7 @@ def _run_one_cycle(
 
             if not result.success:
                 _print(f"  ORDER FAILED: {result.error}")
+                notify_error(f"Order failed for {window_time}: {result.error}")
                 _wait_and_update_outcomes(state, next_ts)
                 return
 
@@ -621,6 +622,7 @@ def _run_one_cycle(
 
                 if fill_status is None:
                     _print(f"    Could not verify fill status. Assuming no fill.")
+                    notify_fill(order_id, 0, shares_requested, 0.0)
                     _wait_and_update_outcomes(state, next_ts)
                     return
 
@@ -629,6 +631,7 @@ def _run_one_cycle(
 
                 if actual_shares <= 0:
                     _print(f"    No fill — order {fill_status.status}. Skipping trade.")
+                    notify_fill(order_id, 0, shares_requested, 0.0)
                     _wait_and_update_outcomes(state, next_ts)
                     return
 
