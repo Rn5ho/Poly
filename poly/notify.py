@@ -179,6 +179,83 @@ def notify_stoploss(
     _send_async(text)
 
 
+def notify_dip_buy(
+    window_time: str,
+    price: float,
+    bet_size: float,
+    shares: float,
+    level: float,
+    total_spent: float,
+    bankroll: float,
+) -> None:
+    """Notify when a dip-buy is triggered during a live window."""
+    odds = (1.0 / price - 1) if price > 0 else 0
+    text = (
+        f"🔻 <b>DIP BUY</b>\n"
+        f"Window: {window_time}\n"
+        f"Up price: {price:.3f} (≤{level:.2f} trigger)\n"
+        f"Size: ${bet_size:.2f} → {shares:.1f} shares\n"
+        f"Odds: {odds:.1f}:1 | Fee: ~{_dip_fee_pct(price):.2f}%\n"
+        f"Window total: ${total_spent:.2f}\n"
+        f"Bankroll: ${bankroll:,.2f}"
+    )
+    _send_async(text)
+
+
+def _dip_fee_pct(price: float) -> float:
+    """Approximate taker fee % at a given price."""
+    return 25.0 * (price * (1 - price)) ** 2
+
+
+def notify_arb_buy(
+    window_time: str,
+    up_price: float,
+    down_price: float,
+    up_bet: float,
+    down_bet: float,
+    guaranteed_profit_pct: float,
+    bankroll: float,
+) -> None:
+    """Notify when a dual-side arb buy is placed."""
+    combined = up_price + down_price
+    text = (
+        f"⚖️ <b>ARB BUY</b>\n"
+        f"Window: {window_time}\n"
+        f"Up: ${up_bet:.2f} @ {up_price:.3f}\n"
+        f"Down: ${down_bet:.2f} @ {down_price:.3f}\n"
+        f"Combined: {combined:.3f} (gap: {1-combined:.3f})\n"
+        f"Min profit: {guaranteed_profit_pct:.1f}%\n"
+        f"Bankroll: ${bankroll:,.2f}"
+    )
+    _send_async(text)
+
+
+def notify_dip_outcome(
+    window_time: str,
+    outcome: str,
+    num_buys: int,
+    total_cost: float,
+    total_pnl: float,
+    bankroll: float,
+    win_rate: float,
+    total_trades: int,
+    mode: str = "DIP",
+) -> None:
+    """Notify resolution for dip-buy or arb trades."""
+    won = total_pnl > 0
+    icon = "🟢" if won else "🔴"
+    label = "PROFIT" if won else "LOSS"
+    text = (
+        f"{icon} <b>{mode} {label}</b>: {outcome}\n"
+        f"Window: {window_time}\n"
+        f"Buys: {num_buys} | Cost: ${total_cost:.2f}\n"
+        f"P&L: <b>${total_pnl:+.2f}</b>\n"
+        f"Bankroll: ${bankroll:,.2f}\n"
+        f"WR: {win_rate:.1%} ({total_trades} trades)"
+    )
+    _send_async(text)
+
+
 def notify_skip(window_time: str, reason: str, bankroll: float) -> None:
     """Notify when a window is skipped (optional, can be noisy)."""
     text = (

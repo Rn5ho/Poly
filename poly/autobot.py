@@ -43,8 +43,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from poly.model import (
+    ARB_BET_PCT,
+    ARB_MAX_COMBINED,
+    ARB_MAX_PER_WINDOW,
+    ARB_MONITOR_SECS,
     DEFAULT_BUY_PRICE,
     DEFAULT_EDGE_THRESHOLD,
+    DIP_ENTRY_PRICE,
+    DIP_LEVELS,
+    DIP_MAX_PER_WINDOW,
+    DIP_MONITOR_SECS,
     KELLY_MULTIPLIER,
     MAKER_BUY_PRICE,
     MAX_BET_PCT,
@@ -53,9 +61,13 @@ from poly.model import (
     conditional_prob_up,
     kelly_fraction,
     net_odds_after_fees,
+    taker_fee_rate,
 )
 from poly.notify import (
     is_configured as _tg_configured,
+    notify_arb_buy,
+    notify_dip_buy,
+    notify_dip_outcome,
     notify_error,
     notify_fill,
     notify_outcome,
@@ -308,6 +320,7 @@ def run_bot(
     resume: bool = True,
     use_maker: bool = False,
     enable_stoploss: bool = False,
+    mode: str = "default",
 ) -> None:
     """Run the automated trading bot.
 
@@ -320,6 +333,7 @@ def run_bot(
         resume: If True, resume from saved state.
         use_maker: If True, use maker (post-only) limit orders ($0 fee).
         enable_stoploss: If True, monitor live windows for stop-loss.
+        mode: Trading mode — "default" (pre-window), "dip", or "arb".
     """
     # Initialize or resume state
     if resume and STATE_FILE.exists():
@@ -338,14 +352,22 @@ def run_bot(
     state.dry_run = dry_run
     state.use_maker = use_maker
     state.save()  # Write initial state so dashboard has data immediately
-    mode = "DRY RUN" if dry_run else "LIVE"
-    order_type = "MAKER ($0 fee)" if use_maker else "TAKER (1.56% fee)"
+    run_mode = "DRY RUN" if dry_run else "LIVE"
+
+    if mode == "dip":
+        order_type = "DIP-BUY (mid-window)"
+    elif mode == "arb":
+        order_type = "DUAL-SIDE ARB"
+    elif use_maker:
+        order_type = "MAKER ($0 fee)"
+    else:
+        order_type = "TAKER (1.56% fee)"
     stoploss_str = f"  |  Stop-loss: {STOP_LOSS_PRICE:.0%}" if enable_stoploss else ""
 
-    # Lazy import for live trading
+    # Lazy import for live trading (default mode only)
     place_order_fn = None
     sell_fn = None
-    if not dry_run:
+    if not dry_run and mode == "default":
         from poly.execute import place_maker_order, place_market_order, sell_shares
         place_order_fn = place_maker_order if use_maker else place_market_order
         sell_fn = sell_shares
@@ -363,7 +385,7 @@ def run_bot(
     # Print banner
     print(flush=True)
     print("=" * 72, flush=True)
-    print(f"  POLY AUTOBOT ({mode}) — {order_type}", flush=True)
+    print(f"  POLY AUTOBOT ({run_mode}) — {order_type}", flush=True)
     print(f"  Bankroll: ${state.bankroll:,.2f}  |  Kelly: {kelly_mult:.0%}  |  Edge: {edge_threshold:.0%}{stoploss_str}", flush=True)
     if _tg_configured():
         print(f"  Telegram: ON", flush=True)
@@ -374,7 +396,7 @@ def run_bot(
     print(flush=True)
 
     # Notify startup
-    notify_startup(mode, order_type, state.bankroll, kelly_mult, edge_threshold, enable_stoploss)
+    notify_startup(run_mode, order_type, state.bankroll, kelly_mult, edge_threshold, enable_stoploss)
 
     # Bootstrap recent outcomes if we don't have them
     if not state.recent_outcomes:
@@ -391,11 +413,16 @@ def run_bot(
     # Main loop
     while not shutdown_event.is_set():
         try:
-            _run_one_cycle(
-                state, edge_threshold, max_bet_pct, kelly_mult,
-                place_order_fn, sell_fn, use_maker, enable_stoploss,
-                shutdown_event,
-            )
+            if mode == "dip":
+                _run_dip_cycle(state, dry_run, shutdown_event)
+            elif mode == "arb":
+                _run_arb_cycle(state, dry_run, shutdown_event)
+            else:
+                _run_one_cycle(
+                    state, edge_threshold, max_bet_pct, kelly_mult,
+                    place_order_fn, sell_fn, use_maker, enable_stoploss,
+                    shutdown_event,
+                )
             state.save()
 
             # Send daily summary at ~00:00 UTC
@@ -769,6 +796,462 @@ def _wait_and_update_outcomes(state: BotState, window_ts: int) -> None:
         state.last_window_ts = window_ts
 
 
+def _run_dip_cycle(
+    state: BotState,
+    dry_run: bool,
+    shutdown_event: threading.Event | None = None,
+) -> None:
+    """Run a dip-buy cycle: wait for window start -> monitor price -> buy dips -> resolve.
+
+    During the live 5-minute window, monitors the Up token price.
+    When it drops below DIP_LEVELS thresholds, places taker buy orders.
+    Taker fees at low prices are negligible (~0.16% at 22c).
+    Holds all shares to resolution.
+    """
+    # Catch up on any missed windows
+    _catch_up_outcomes(state)
+
+    # Determine the next window
+    next_ts = _next_window_ts()
+    next_dt = datetime.fromtimestamp(next_ts, tz=timezone.utc)
+    window_time = next_dt.strftime("%H:%M UTC")
+
+    if next_ts <= state.last_window_ts:
+        next_ts += WINDOW_SECONDS
+        next_dt = datetime.fromtimestamp(next_ts, tz=timezone.utc)
+        window_time = next_dt.strftime("%H:%M UTC")
+
+    # Wait until window STARTS (not before — we buy during live action)
+    now = time.time()
+    if now < next_ts:
+        wait_secs = next_ts - now
+        _print(f"Next window: {next_dt.strftime('%H:%M:%S UTC')}  (waiting {wait_secs:.0f}s for start)")
+        while time.time() < next_ts:
+            if shutdown_event and shutdown_event.wait(min(5.0, max(0, next_ts - time.time()))):
+                return
+
+    # Fetch market for token IDs
+    market = _fetch_5m_market(next_ts)
+    if not market or not market.up_token_id:
+        _print(f"  Market not found for {window_time}. Skipping.")
+        _wait_and_update_outcomes(state, next_ts)
+        return
+
+    up_token_id = market.up_token_id
+    condition_id = market.condition_id
+    _print(f"Window {window_time}  |  DIP MODE  |  Monitoring Up token for dips...")
+
+    # Monitor and buy dips during live window
+    monitor_end = next_ts + DIP_MONITOR_SECS
+    window_end = next_ts + WINDOW_SECONDS
+    triggered_levels: set[float] = set()
+    buys: list[dict] = []
+    total_spent = 0.0
+    max_spend = state.bankroll * DIP_MAX_PER_WINDOW
+
+    # Start WebSocket stream for sub-second price updates
+    stream = _try_start_market_stream(up_token_id, condition_id)
+    use_ws = stream is not None
+
+    try:
+        while time.time() < min(monitor_end, window_end - 30):
+            if shutdown_event and shutdown_event.is_set():
+                return
+
+            # Get current Up price
+            current_price = None
+            if use_ws and stream and stream.last_price is not None:
+                current_price = stream.last_price
+            else:
+                current_price = _get_up_price_from_clob(up_token_id)
+
+            if current_price is None:
+                time.sleep(2)
+                continue
+
+            # Check each dip level
+            for level_price, bet_pct in DIP_LEVELS:
+                if level_price in triggered_levels:
+                    continue
+                if current_price > level_price:
+                    continue
+                if total_spent >= max_spend:
+                    break
+
+                bet_size = min(
+                    state.bankroll * bet_pct,
+                    max_spend - total_spent,
+                )
+                if bet_size < MIN_BET:
+                    continue
+
+                shares = bet_size / current_price
+                fee_pct = taker_fee_rate(current_price) * 100
+                odds = 1.0 / current_price - 1.0
+
+                _print(
+                    f"  >>> DIP BUY @ {current_price:.3f}  |  "
+                    f"${bet_size:.2f} → {shares:.1f} shares  |  "
+                    f"Odds: {odds:.1f}:1  |  Fee: {fee_pct:.2f}%  |  "
+                    f"Level: ≤{level_price:.2f}"
+                )
+
+                # Place order
+                order_id = None
+                if not dry_run:
+                    from poly.execute import place_taker_buy
+                    result = place_taker_buy(up_token_id, bet_size)
+                    if result.success:
+                        order_id = result.order_id
+                        _print(f"    ORDER: {order_id}")
+                    else:
+                        _print(f"    ORDER FAILED: {result.error}")
+                        notify_error(f"Dip buy failed at {current_price:.3f}: {result.error}")
+                        continue
+                else:
+                    _print(f"    [DRY RUN] Would buy ${bet_size:.2f} of Up @ {current_price:.3f}")
+
+                buys.append({
+                    "price": current_price,
+                    "size": bet_size,
+                    "shares": shares,
+                    "level": level_price,
+                    "order_id": order_id,
+                })
+                total_spent += bet_size
+                triggered_levels.add(level_price)
+
+                notify_dip_buy(
+                    window_time=window_time,
+                    price=current_price,
+                    bet_size=bet_size,
+                    shares=shares,
+                    level=level_price,
+                    total_spent=total_spent,
+                    bankroll=state.bankroll,
+                )
+
+            # Sleep between price checks
+            if not use_ws or (stream and stream.last_price is None):
+                time.sleep(STOPLOSS_POLL)
+            else:
+                time.sleep(1)
+    finally:
+        if stream:
+            stream.stop()
+
+    if not buys:
+        _print(f"  No dips below {DIP_ENTRY_PRICE:.2f} this window.")
+        _wait_and_update_outcomes(state, next_ts)
+        return
+
+    # Wait for resolution
+    outcome = _wait_for_resolution(next_ts)
+    if not outcome:
+        _print("  Resolution timeout!")
+        state.last_window_ts = next_ts
+        return
+
+    # Calculate P&L across all dip buys
+    total_shares = sum(b["shares"] for b in buys)
+    total_cost = sum(b["size"] for b in buys)
+    avg_price = total_cost / total_shares if total_shares > 0 else 0
+
+    if outcome == "Up":
+        # Each share pays $1.00 at resolution (minus entry fee, already deducted)
+        avg_fee = taker_fee_rate(avg_price)
+        effective_shares = total_shares * (1 - avg_fee)
+        pnl = effective_shares - total_cost
+        won = True
+    else:
+        pnl = -total_cost
+        won = False
+
+    # Update state
+    state.bankroll += pnl
+    state.total_pnl += pnl
+    state.total_trades += 1
+    if won:
+        state.total_wins += 1
+    if state.bankroll > state.peak_bankroll:
+        state.peak_bankroll = state.bankroll
+    dd = state.current_drawdown
+    if dd > state.max_drawdown:
+        state.max_drawdown = dd
+
+    state.recent_outcomes.append(outcome)
+    if len(state.recent_outcomes) > 5:
+        state.recent_outcomes.pop(0)
+    state.last_window_ts = next_ts
+
+    result_str = "WIN" if won else "LOSS"
+    _print(
+        f"  {result_str}: {outcome}  |  {len(buys)} buys @ avg {avg_price:.3f}  |  "
+        f"PnL: ${pnl:+.2f}  |  Bank: ${state.bankroll:.2f}  |  "
+        f"WR: {state.win_rate:.1%}"
+    )
+
+    notify_dip_outcome(
+        window_time=window_time, outcome=outcome, num_buys=len(buys),
+        total_cost=total_cost, total_pnl=pnl, bankroll=state.bankroll,
+        win_rate=state.win_rate, total_trades=state.total_trades, mode="DIP",
+    )
+
+    _log_trade({
+        "ts": next_ts,
+        "time": datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat(),
+        "side": "DIP BUY UP",
+        "order_type": "DIP",
+        "model_p": 0,
+        "buy_price": avg_price,
+        "edge": 0,
+        "bet": total_cost,
+        "shares_requested": round(total_shares, 2),
+        "shares_filled": round(total_shares, 2),
+        "fill_fraction": 1.0,
+        "outcome": outcome,
+        "won": won,
+        "stopped_out": False,
+        "pnl": pnl,
+        "bankroll": state.bankroll,
+        "win_rate": state.win_rate,
+        "drawdown": dd,
+        "dip_buys": buys,
+    })
+
+
+def _run_arb_cycle(
+    state: BotState,
+    dry_run: bool,
+    shutdown_event: threading.Event | None = None,
+) -> None:
+    """Run a dual-side arb cycle: buy both Up+Down when combined < threshold.
+
+    Monitors both Up and Down token prices during the live window.
+    When combined price < ARB_MAX_COMBINED, buys both sides.
+    Guaranteed profit = $1.00 - combined_cost per share-pair.
+    """
+    # Catch up on missed windows
+    _catch_up_outcomes(state)
+
+    # Next window
+    next_ts = _next_window_ts()
+    next_dt = datetime.fromtimestamp(next_ts, tz=timezone.utc)
+    window_time = next_dt.strftime("%H:%M UTC")
+
+    if next_ts <= state.last_window_ts:
+        next_ts += WINDOW_SECONDS
+        next_dt = datetime.fromtimestamp(next_ts, tz=timezone.utc)
+        window_time = next_dt.strftime("%H:%M UTC")
+
+    # Wait for window START
+    now = time.time()
+    if now < next_ts:
+        wait_secs = next_ts - now
+        _print(f"Next window: {next_dt.strftime('%H:%M:%S UTC')}  (waiting {wait_secs:.0f}s for start)")
+        while time.time() < next_ts:
+            if shutdown_event and shutdown_event.wait(min(5.0, max(0, next_ts - time.time()))):
+                return
+
+    # Fetch market for both token IDs
+    market = _fetch_5m_market(next_ts)
+    if not market or not market.up_token_id or not market.down_token_id:
+        _print(f"  Market not found for {window_time}. Skipping.")
+        _wait_and_update_outcomes(state, next_ts)
+        return
+
+    up_token_id = market.up_token_id
+    down_token_id = market.down_token_id
+    _print(f"Window {window_time}  |  ARB MODE  |  Monitoring Up+Down prices...")
+
+    # Monitor for arb opportunities
+    monitor_end = next_ts + ARB_MONITOR_SECS
+    window_end = next_ts + WINDOW_SECONDS
+    arb_buys: list[dict] = []
+    total_spent = 0.0
+    max_spend = state.bankroll * ARB_MAX_PER_WINDOW
+
+    while time.time() < min(monitor_end, window_end - 30):
+        if shutdown_event and shutdown_event.is_set():
+            return
+
+        # Get prices for both sides
+        up_price = _get_up_price_from_clob(up_token_id)
+        down_price = _get_up_price_from_clob(down_token_id)  # same func, gets best bid
+
+        if up_price is None or down_price is None:
+            time.sleep(STOPLOSS_POLL)
+            continue
+
+        combined = up_price + down_price
+
+        if combined < ARB_MAX_COMBINED and total_spent < max_spend:
+            gap = 1.0 - combined
+            guaranteed_pct = gap / combined * 100
+
+            bet_size = min(
+                state.bankroll * ARB_BET_PCT,
+                max_spend - total_spent,
+            )
+            if bet_size < MIN_BET * 2:  # need enough for both sides
+                time.sleep(STOPLOSS_POLL)
+                continue
+
+            # Split bet proportionally: more on the cheaper side (higher return)
+            # Equal share-pairs: buy N shares of each side
+            # Cost per pair = up_price + down_price, payout = $1.00
+            share_pairs = bet_size / combined
+            up_cost = share_pairs * up_price
+            down_cost = share_pairs * down_price
+
+            _print(
+                f"  >>> ARB @ combined={combined:.3f}  |  "
+                f"Up={up_price:.3f} (${up_cost:.2f})  Down={down_price:.3f} (${down_cost:.2f})  |  "
+                f"Gap: {gap:.3f} ({guaranteed_pct:.1f}% guaranteed)"
+            )
+
+            up_order_id = None
+            down_order_id = None
+            if not dry_run:
+                from poly.execute import place_taker_buy
+                # Buy Up
+                up_result = place_taker_buy(up_token_id, up_cost)
+                if up_result.success:
+                    up_order_id = up_result.order_id
+                    _print(f"    UP ORDER: {up_order_id}")
+                else:
+                    _print(f"    UP ORDER FAILED: {up_result.error}")
+                    notify_error(f"Arb Up buy failed: {up_result.error}")
+                    time.sleep(STOPLOSS_POLL)
+                    continue
+
+                # Buy Down
+                down_result = place_taker_buy(down_token_id, down_cost)
+                if down_result.success:
+                    down_order_id = down_result.order_id
+                    _print(f"    DOWN ORDER: {down_order_id}")
+                else:
+                    _print(f"    DOWN ORDER FAILED: {down_result.error}")
+                    notify_error(f"Arb Down buy failed: {down_result.error}")
+                    # Still have the Up position — will resolve naturally
+            else:
+                _print(
+                    f"    [DRY RUN] Would buy Up ${up_cost:.2f} @ {up_price:.3f} "
+                    f"+ Down ${down_cost:.2f} @ {down_price:.3f}"
+                )
+
+            actual_cost = up_cost + down_cost
+            arb_buys.append({
+                "up_price": up_price,
+                "down_price": down_price,
+                "up_cost": up_cost,
+                "down_cost": down_cost,
+                "share_pairs": share_pairs,
+                "combined": combined,
+                "gap": gap,
+                "up_order_id": up_order_id,
+                "down_order_id": down_order_id,
+            })
+            total_spent += actual_cost
+
+            notify_arb_buy(
+                window_time=window_time,
+                up_price=up_price,
+                down_price=down_price,
+                up_bet=up_cost,
+                down_bet=down_cost,
+                guaranteed_profit_pct=guaranteed_pct,
+                bankroll=state.bankroll,
+            )
+
+            # Cool down — don't stack arbs in the same second
+            time.sleep(5)
+        else:
+            time.sleep(STOPLOSS_POLL)
+
+    if not arb_buys:
+        _print(f"  No arb opportunity (combined never < {ARB_MAX_COMBINED:.2f})")
+        _wait_and_update_outcomes(state, next_ts)
+        return
+
+    # Wait for resolution
+    outcome = _wait_for_resolution(next_ts)
+    if not outcome:
+        _print("  Resolution timeout!")
+        state.last_window_ts = next_ts
+        return
+
+    # Calculate P&L: one side wins ($1/share), the other loses ($0)
+    total_up_shares = sum(b["share_pairs"] for b in arb_buys)
+    total_down_shares = total_up_shares  # equal share-pairs by design
+    total_cost = sum(b["up_cost"] + b["down_cost"] for b in arb_buys)
+
+    if outcome == "Up":
+        # Up shares pay $1.00 each (minus taker fee)
+        avg_up_price = sum(b["up_cost"] for b in arb_buys) / total_up_shares if total_up_shares else 0
+        fee = taker_fee_rate(avg_up_price)
+        payout = total_up_shares * (1 - fee)
+    else:
+        avg_down_price = sum(b["down_cost"] for b in arb_buys) / total_down_shares if total_down_shares else 0
+        fee = taker_fee_rate(avg_down_price)
+        payout = total_down_shares * (1 - fee)
+
+    pnl = payout - total_cost
+    won = pnl > 0
+
+    # Update state
+    state.bankroll += pnl
+    state.total_pnl += pnl
+    state.total_trades += 1
+    if won:
+        state.total_wins += 1
+    if state.bankroll > state.peak_bankroll:
+        state.peak_bankroll = state.bankroll
+    dd = state.current_drawdown
+    if dd > state.max_drawdown:
+        state.max_drawdown = dd
+
+    state.recent_outcomes.append(outcome)
+    if len(state.recent_outcomes) > 5:
+        state.recent_outcomes.pop(0)
+    state.last_window_ts = next_ts
+
+    result_str = "WIN" if won else "LOSS"
+    _print(
+        f"  {result_str}: {outcome}  |  {len(arb_buys)} arb(s)  |  "
+        f"Cost: ${total_cost:.2f} → Payout: ${payout:.2f}  |  "
+        f"PnL: ${pnl:+.2f}  |  Bank: ${state.bankroll:.2f}"
+    )
+
+    notify_dip_outcome(
+        window_time=window_time, outcome=outcome, num_buys=len(arb_buys),
+        total_cost=total_cost, total_pnl=pnl, bankroll=state.bankroll,
+        win_rate=state.win_rate, total_trades=state.total_trades, mode="ARB",
+    )
+
+    _log_trade({
+        "ts": next_ts,
+        "time": datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat(),
+        "side": "ARB",
+        "order_type": "ARB",
+        "model_p": 0,
+        "buy_price": 0,
+        "edge": 0,
+        "bet": total_cost,
+        "shares_requested": round(total_up_shares, 2),
+        "shares_filled": round(total_up_shares, 2),
+        "fill_fraction": 1.0,
+        "outcome": outcome,
+        "won": won,
+        "stopped_out": False,
+        "pnl": pnl,
+        "bankroll": state.bankroll,
+        "win_rate": state.win_rate,
+        "drawdown": dd,
+        "arb_buys": arb_buys,
+    })
+
+
 def main():
     import argparse
 
@@ -782,10 +1265,19 @@ def main():
     parser.add_argument("--maker", action="store_true", help="Use maker orders ($0 fee, recommended)")
     parser.add_argument("--taker", action="store_true", help="Use taker orders (1.56% fee)")
     parser.add_argument("--stoploss", action="store_true", help="Enable stop-loss monitoring during live windows")
+    parser.add_argument("--dip", action="store_true", help="Dip-buy mode: buy Up when it crashes mid-window")
+    parser.add_argument("--arb", action="store_true", help="Arb mode: buy both sides when combined < $1")
     args = parser.parse_args()
 
     # Default to maker if neither specified
     use_maker = args.maker or not args.taker
+
+    # Determine mode
+    mode = "default"
+    if args.dip:
+        mode = "dip"
+    elif args.arb:
+        mode = "arb"
 
     run_bot(
         bankroll=args.bankroll,
@@ -796,6 +1288,7 @@ def main():
         resume=not args.fresh,
         use_maker=use_maker,
         enable_stoploss=args.stoploss,
+        mode=mode,
     )
 
 

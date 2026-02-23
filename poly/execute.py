@@ -274,6 +274,52 @@ def place_market_order(
         )
 
 
+def place_taker_buy(
+    token_id: str,
+    amount_usd: float,
+) -> TradeResult:
+    """Place a fill-or-kill taker buy for a token.
+
+    Simple taker buy that takes a token_id directly — used for
+    dip-buying and arb during live windows where we need immediate fills.
+
+    At low prices the fee is negligible: ~0.16% at 22c vs 1.56% at 50c.
+
+    Args:
+        token_id: CLOB token ID for the outcome to buy.
+        amount_usd: Total USD to spend.
+    """
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY
+
+    client = _get_client()
+
+    try:
+        market_order = MarketOrderArgs(
+            token_id=token_id,
+            amount=amount_usd,
+            side=BUY,
+        )
+        signed_order = client.create_market_order(market_order)
+        response = client.post_order(signed_order, OrderType.FOK)
+
+        return TradeResult(
+            success=True,
+            order_id=response.get("orderId"),
+            side="BUY",
+            token_id=token_id,
+            price=0,  # market order — price determined by book
+            size=amount_usd,
+            error=None,
+        )
+    except Exception as e:
+        return TradeResult(
+            success=False, order_id=None, side="BUY",
+            token_id=token_id, price=0, size=amount_usd,
+            error=str(e),
+        )
+
+
 def sell_shares(
     token_id: str,
     size: float,

@@ -55,6 +55,25 @@ MAKER_BUY_PRICE = 0.500  # typical bid price for maker orders (resting on book)
 STOP_LOSS_PRICE = 0.30  # sell Up shares if price drops below 30c during window
 STOP_LOSS_ENABLED = True  # enable stop-loss monitoring during live windows
 
+# --- Dip-buy parameters (buy Up when it crashes mid-window) ---
+# At low prices, taker fee is negligible: 0.16% at 22c vs 1.56% at 50c
+DIP_ENTRY_PRICE = 0.35  # start buying when Up drops below 35c
+DIP_LEVELS: list[tuple[float, float]] = [
+    # (price_at_or_below, bankroll_fraction)
+    (0.35, 0.015),  # 1.5% of bankroll when Up ≤ 35c (odds ~1.86:1)
+    (0.25, 0.020),  # 2.0% of bankroll when Up ≤ 25c (odds ~3.0:1)
+    (0.15, 0.025),  # 2.5% of bankroll when Up ≤ 15c (odds ~5.7:1)
+]
+DIP_MAX_PER_WINDOW = 0.06  # max 6% of bankroll total per window
+DIP_MONITOR_SECS = 240  # monitor first 4 minutes (leave 60s before resolution)
+
+# --- Dual-side arbitrage parameters (buy both Up+Down when combined < $1) ---
+# Guaranteed profit when combined entry < $1.00: profit = $1.00 - combined_cost
+ARB_MAX_COMBINED = 0.88  # buy both sides when combined price < 88c (12%+ guaranteed)
+ARB_BET_PCT = 0.04  # 4% of bankroll per arb opportunity
+ARB_MAX_PER_WINDOW = 0.08  # max 8% total per window
+ARB_MONITOR_SECS = 240  # monitor first 4 minutes
+
 
 def taker_fee_rate(price: float) -> float:
     """Polymarket taker fee as fraction of share price.

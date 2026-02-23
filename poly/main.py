@@ -388,6 +388,8 @@ def main():
     p_auto.add_argument("--maker", action="store_true", help="Use maker orders ($0 fee, recommended)")
     p_auto.add_argument("--taker", action="store_true", help="Use taker orders (1.56% fee)")
     p_auto.add_argument("--stoploss", action="store_true", help="Enable stop-loss during live windows")
+    p_auto.add_argument("--dip", action="store_true", help="Dip-buy mode: buy Up when it crashes mid-window")
+    p_auto.add_argument("--arb", action="store_true", help="Arb mode: buy both sides when combined < $1")
 
     # status
     sub.add_parser("status", help="Show current bot status from saved state/logs")
@@ -425,6 +427,11 @@ def main():
             from poly.autobot import run_bot
 
             use_maker = args.maker or not args.taker
+            bot_mode = "default"
+            if args.dip:
+                bot_mode = "dip"
+            elif args.arb:
+                bot_mode = "arb"
             run_bot(
                 bankroll=args.bankroll,
                 edge_threshold=args.edge,
@@ -434,6 +441,7 @@ def main():
                 resume=not args.fresh,
                 use_maker=use_maker,
                 enable_stoploss=args.stoploss,
+                mode=bot_mode,
             )
         elif args.command == "status":
             _show_status()
