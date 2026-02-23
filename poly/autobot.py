@@ -72,6 +72,7 @@ from poly.notify import (
     notify_fill,
     notify_outcome,
     notify_shutdown,
+    notify_skip,
     notify_startup,
     notify_stoploss,
     notify_trade_placed,
@@ -482,47 +483,6 @@ def run_bot(
     print(flush=True)
 
 
-def _catch_up_outcomes(state: BotState) -> None:
-    """Fetch outcomes for any windows between last processed and now.
-
-    The bot takes ~6 minutes per cycle (5-min window + 60s resolution wait),
-    so it can fall behind and miss windows. This fills in the gaps so that
-    recent_outcomes always reflects the true sequence.
-    """
-    if not state.last_window_ts:
-        return
-
-    now = int(time.time())
-    current_window = (now // WINDOW_SECONDS) * WINDOW_SECONDS
-
-    # Collect windows that have ended but weren't processed
-    missed = []
-    ts = state.last_window_ts + WINDOW_SECONDS
-    while ts < current_window:  # only windows that have fully ended
-        missed.append(ts)
-        ts += WINDOW_SECONDS
-
-    if not missed:
-        return
-
-    _print(f"  Catching up {len(missed)} missed window(s)...")
-    caught = 0
-    for ts in missed:
-        outcome = _fetch_resolved_outcome(ts, verbose=(caught == 0))
-        if outcome:
-            state.recent_outcomes.append(outcome)
-            if len(state.recent_outcomes) > 5:
-                state.recent_outcomes.pop(0)
-            state.last_window_ts = ts
-            caught += 1
-        else:
-            # Skip unresolvable windows — still advance last_window_ts
-            # so we don't re-attempt the same stuck window forever
-            state.last_window_ts = ts
-
-    if missed:
-        _print(f"  Caught up {caught}/{len(missed)} outcomes: {' → '.join(state.recent_outcomes[-5:])}")
-
 
 def _run_one_cycle(
     state: BotState,
@@ -537,8 +497,13 @@ def _run_one_cycle(
 ) -> None:
     """Run a single trade cycle: wait → book → evaluate → trade → verify → monitor → resolve."""
 
-    # Catch up on any missed windows before evaluating
-    _catch_up_outcomes(state)
+    # Refresh outcomes from API (fast, parallel) — replaces slow sequential catch-up
+    fresh = fetch_recent_outcomes(n=5)
+    if fresh:
+        state.recent_outcomes = fresh
+        _print(f"  Outcomes: {' → '.join(fresh)}")
+    elif not state.recent_outcomes:
+        _print("  No outcomes available (API may be slow)")
 
     # Determine the next window to trade
     next_ts = _next_window_ts()
@@ -608,8 +573,15 @@ def _run_one_cycle(
 
     # Decide whether to trade
     if edge <= edge_threshold:
-        _print(f"  No edge ({edge:+.1%} < {edge_threshold:.0%}). Skipping.")
-        _wait_and_update_outcomes(state, next_ts, shutdown_event)
+        _print(f"  Skip ({edge:+.1%} < {edge_threshold:.0%})")
+        # Don't wait for resolution — just advance and return immediately.
+        # Next cycle will refresh outcomes from API (fast, parallel).
+        state.last_window_ts = next_ts
+        notify_skip(
+            window_time=datetime.fromtimestamp(next_ts, tz=timezone.utc).strftime("%H:%M UTC"),
+            reason=f"Edge {edge:+.1%} < {edge_threshold:.0%}",
+            bankroll=state.bankroll,
+        )
         return
 
     # Size the bet using live price
@@ -620,7 +592,7 @@ def _run_one_cycle(
 
     if bet_size < MIN_BET:
         _print(f"  Bet too small (${bet_size:.2f} < ${MIN_BET}). Skipping.")
-        _wait_and_update_outcomes(state, next_ts, shutdown_event)
+        state.last_window_ts = next_ts
         return
 
     _print(f"  >>> BUY UP ({order_label})  |  Bet: ${bet_size:.2f}  |  Kelly: {kf:.1%}  |  Bank: ${state.bankroll:.2f}")
@@ -663,7 +635,7 @@ def _run_one_cycle(
             if not result.success:
                 _print(f"  ORDER FAILED: {result.error}")
                 notify_error(f"Order failed for {window_time}: {result.error}")
-                _wait_and_update_outcomes(state, next_ts, shutdown_event)
+                state.last_window_ts = next_ts
                 return
 
             order_id = result.order_id
@@ -685,7 +657,7 @@ def _run_one_cycle(
                 if fill_status is None:
                     _print(f"    Could not verify fill status. Assuming no fill.")
                     notify_fill(order_id, 0, shares_requested, 0.0)
-                    _wait_and_update_outcomes(state, next_ts, shutdown_event)
+                    state.last_window_ts = next_ts
                     return
 
                 actual_shares = fill_status.size_matched
@@ -694,7 +666,7 @@ def _run_one_cycle(
                 if actual_shares <= 0:
                     _print(f"    No fill — order {fill_status.status}. Skipping trade.")
                     notify_fill(order_id, 0, shares_requested, 0.0)
-                    _wait_and_update_outcomes(state, next_ts, shutdown_event)
+                    state.last_window_ts = next_ts
                     return
 
                 actual_bet = actual_shares * buy_price
@@ -817,23 +789,6 @@ def _run_one_cycle(
     })
 
 
-def _wait_and_update_outcomes(
-    state: BotState,
-    window_ts: int,
-    shutdown_event: threading.Event | None = None,
-) -> None:
-    """Wait for a window to resolve and update outcome history (no trade)."""
-    outcome = _wait_for_resolution(window_ts, shutdown_event)
-    if outcome:
-        state.recent_outcomes.append(outcome)
-        if len(state.recent_outcomes) > 5:
-            state.recent_outcomes.pop(0)
-        state.last_window_ts = window_ts
-        _print(f"  Outcome: {outcome} (no trade)")
-    else:
-        _print("  Resolution timeout. Outcomes may be stale.")
-        state.last_window_ts = window_ts
-
 
 def _run_dip_cycle(
     state: BotState,
@@ -847,8 +802,10 @@ def _run_dip_cycle(
     Taker fees at low prices are negligible (~0.16% at 22c).
     Holds all shares to resolution.
     """
-    # Catch up on any missed windows
-    _catch_up_outcomes(state)
+    # Refresh outcomes from API (fast, parallel)
+    fresh = fetch_recent_outcomes(n=5)
+    if fresh:
+        state.recent_outcomes = fresh
 
     # Determine the next window
     next_ts = _next_window_ts()
@@ -873,7 +830,7 @@ def _run_dip_cycle(
     market = _fetch_5m_market(next_ts)
     if not market or not market.up_token_id:
         _print(f"  Market not found for {window_time}. Skipping.")
-        _wait_and_update_outcomes(state, next_ts, shutdown_event)
+        state.last_window_ts = next_ts
         return
 
     up_token_id = market.up_token_id
@@ -981,7 +938,7 @@ def _run_dip_cycle(
 
     if not buys:
         _print(f"  No dips below {DIP_ENTRY_PRICE:.2f} this window.")
-        _wait_and_update_outcomes(state, next_ts, shutdown_event)
+        state.last_window_ts = next_ts
         return
 
     # Wait for resolution
@@ -1070,8 +1027,10 @@ def _run_arb_cycle(
     When combined price < ARB_MAX_COMBINED, buys both sides.
     Guaranteed profit = $1.00 - combined_cost per share-pair.
     """
-    # Catch up on missed windows
-    _catch_up_outcomes(state)
+    # Refresh outcomes from API (fast, parallel)
+    fresh = fetch_recent_outcomes(n=5)
+    if fresh:
+        state.recent_outcomes = fresh
 
     # Next window
     next_ts = _next_window_ts()
@@ -1096,7 +1055,7 @@ def _run_arb_cycle(
     market = _fetch_5m_market(next_ts)
     if not market or not market.up_token_id or not market.down_token_id:
         _print(f"  Market not found for {window_time}. Skipping.")
-        _wait_and_update_outcomes(state, next_ts, shutdown_event)
+        state.last_window_ts = next_ts
         return
 
     up_token_id = market.up_token_id
@@ -1210,7 +1169,7 @@ def _run_arb_cycle(
 
     if not arb_buys:
         _print(f"  No arb opportunity (combined never < {ARB_MAX_COMBINED:.2f})")
-        _wait_and_update_outcomes(state, next_ts, shutdown_event)
+        state.last_window_ts = next_ts
         return
 
     # Wait for resolution
