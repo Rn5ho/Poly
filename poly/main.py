@@ -254,6 +254,59 @@ def _print_summary(actionable: list) -> None:
     print()
 
 
+def _test_notify() -> None:
+    """Send test messages through all Telegram notification types."""
+    import poly.notify as notify
+
+    print("=" * 72)
+    print("  TELEGRAM NOTIFICATION TEST")
+    print("=" * 72)
+
+    if not notify.is_configured():
+        print("\n  Telegram is NOT configured.")
+        print("  Set these environment variables:\n")
+        print("    export TELEGRAM_BOT_TOKEN='123456:ABC-DEF...'")
+        print("    export TELEGRAM_CHAT_ID='987654321'\n")
+        print("  Get a bot token from @BotFather on Telegram.")
+        print("  Get your chat ID: curl https://api.telegram.org/bot<TOKEN>/getUpdates\n")
+        return
+
+    print("\n  Telegram configured. Sending test messages...\n")
+
+    window = "14:35-14:40 UTC"
+    msgs = [
+        ("Startup", lambda: notify.notify_startup(
+            "DRY RUN", "MAKER", 500.0, 0.25, 0.03, True)),
+        ("Trade placed", lambda: notify.notify_trade_placed(
+            window, "BUY UP", "MAKER GTC", 15.0, 0.500, 0.560, 0.060, 500.0, 2)),
+        ("Fill update", lambda: notify.notify_fill(
+            "test-order-123", 30.0, 30.0, 1.0)),
+        ("Dip buy", lambda: notify.notify_dip_buy(
+            window, 0.220, 10.0, 45.5, 0.25, 10.0, 490.0)),
+        ("Outcome (win)", lambda: notify.notify_outcome(
+            window, "Up", True, 15.0, 515.0, 0.560, 10, 0.05)),
+        ("Outcome (loss)", lambda: notify.notify_outcome(
+            window, "Down", False, -15.0, 485.0, 0.500, 11, 0.06)),
+        ("Stop-loss", lambda: notify.notify_stoploss(
+            window, 0.28, -7.20, 0.52)),
+        ("Dip outcome", lambda: notify.notify_dip_outcome(
+            window, "Up", 3, 25.0, 88.5, 588.0, 0.580, 15)),
+        ("Error", lambda: notify.notify_error(
+            "Test error — this is a dry-run notification test.")),
+        ("Shutdown", lambda: notify.notify_shutdown(
+            515.0, 12, 0.583, 15.0, 0.06)),
+    ]
+
+    for name, send_fn in msgs:
+        send_fn()
+        # notify_shutdown is blocking, rest are async — small sleep for ordering
+        import time
+        time.sleep(1.2)
+        print(f"  [OK] {name}")
+
+    print(f"\n  Sent {len(msgs)} test messages. Check your Telegram.\n")
+
+
 def _show_status() -> None:
     """Print current bot status from saved state and trade log."""
     import json
@@ -391,6 +444,9 @@ def main():
     p_auto.add_argument("--dip", action="store_true", help="Dip-buy mode: buy Up when it crashes mid-window")
     p_auto.add_argument("--arb", action="store_true", help="Arb mode: buy both sides when combined < $1")
 
+    # test-notify
+    sub.add_parser("test-notify", help="Send test messages through all Telegram notification types")
+
     # status
     sub.add_parser("status", help="Show current bot status from saved state/logs")
 
@@ -443,6 +499,8 @@ def main():
                 enable_stoploss=args.stoploss,
                 mode=bot_mode,
             )
+        elif args.command == "test-notify":
+            _test_notify()
         elif args.command == "status":
             _show_status()
         elif args.command == "dashboard":
