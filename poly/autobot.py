@@ -76,6 +76,8 @@ from poly.notify import (
     notify_stoploss,
     notify_trade_placed,
     send_daily_summary,
+    start_command_handler,
+    stop_command_handler,
 )
 from poly.polymarket import (
     WINDOW_SECONDS,
@@ -395,8 +397,9 @@ def run_bot(
     print("=" * 72, flush=True)
     print(flush=True)
 
-    # Notify startup
+    # Notify startup + start Telegram command handler
     notify_startup(run_mode, order_type, state.bankroll, kelly_mult, edge_threshold, enable_stoploss)
+    start_command_handler()
 
     # Bootstrap recent outcomes if we don't have them
     if not state.recent_outcomes:
@@ -439,6 +442,7 @@ def run_bot(
             shutdown_event.wait(30)  # back off on errors (interruptible)
 
     # Final save
+    stop_command_handler()
     state.save()
     notify_shutdown(state.bankroll, state.total_trades, state.win_rate, state.total_pnl, state.max_drawdown)
     print(flush=True)
