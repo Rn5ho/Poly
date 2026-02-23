@@ -153,7 +153,7 @@ def fetch_5m_markets(
     return markets
 
 
-def _fetch_resolved_outcome(timestamp: int) -> str | None:
+def _fetch_resolved_outcome(timestamp: int, verbose: bool = False) -> str | None:
     """Fetch the resolved outcome for a 5-minute window.
 
     Returns "Up", "Down", or None if not resolved.
@@ -168,22 +168,55 @@ def _fetch_resolved_outcome(timestamp: int) -> str | None:
         resp.raise_for_status()
         results = resp.json()
         if not results:
+            if verbose:
+                print(f"    [resolve] {slug}: no results from API", flush=True)
             return None
 
         m = results[0]
-        if not m.get("closed"):
+        closed = m.get("closed")
+        if not closed:
+            if verbose:
+                prices_raw = m.get("outcomePrices", "[]")
+                print(
+                    f"    [resolve] {slug}: not closed (closed={closed!r}, "
+                    f"prices={prices_raw})",
+                    flush=True,
+                )
             return None
 
         outcome_prices = json.loads(m.get("outcomePrices", "[]"))
         if len(outcome_prices) < 2:
+            if verbose:
+                print(f"    [resolve] {slug}: closed but <2 outcome prices", flush=True)
             return None
 
-        if outcome_prices[0] == "1":
+        # Use float comparison for robustness (API may return "1", "1.0", etc.)
+        try:
+            up_price = float(outcome_prices[0])
+            down_price = float(outcome_prices[1])
+        except (ValueError, TypeError):
+            if verbose:
+                print(
+                    f"    [resolve] {slug}: can't parse prices {outcome_prices}",
+                    flush=True,
+                )
+            return None
+
+        if up_price > 0.99:
             return "Up"
-        elif outcome_prices[1] == "1":
+        elif down_price > 0.99:
             return "Down"
+
+        if verbose:
+            print(
+                f"    [resolve] {slug}: closed but prices not settled "
+                f"(up={up_price}, down={down_price})",
+                flush=True,
+            )
         return None
-    except Exception:
+    except Exception as e:
+        if verbose:
+            print(f"    [resolve] {slug}: exception: {e}", flush=True)
         return None
 
 

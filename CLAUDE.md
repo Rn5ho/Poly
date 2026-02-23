@@ -119,7 +119,7 @@ Source: `docs.polymarket.com/developers/market-makers/maker-rebates-program`
 ### Fee Formula
 
 ```
-fee = C × p × feeRate × (p × (1-p))^exponent
+fee = C × feeRate × (p × (1-p))^exponent
 ```
 where C=shares, p=price. Fee collected as shares on buys, USDC on sells.
 

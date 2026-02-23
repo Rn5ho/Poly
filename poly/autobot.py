@@ -91,11 +91,11 @@ from poly.polymarket import (
 # How early (seconds) before window start to place orders
 ORDER_LEAD_TIME = 30
 # How long after window end to wait for resolution
-RESOLUTION_WAIT = 60
+RESOLUTION_WAIT = 30
 # How often to poll for resolution
 RESOLUTION_POLL = 10
 # Max time to wait for resolution before giving up
-RESOLUTION_TIMEOUT = 300
+RESOLUTION_TIMEOUT = 600
 # How often to check price during stop-loss monitoring
 STOPLOSS_POLL = 5
 
@@ -187,19 +187,23 @@ def _wait_for_resolution(
         else:
             time.sleep(wait)
 
-    # Poll for resolution
+    # Poll for resolution (verbose on first attempt and every 60s)
     deadline = time.time() + RESOLUTION_TIMEOUT
+    poll_count = 0
     while time.time() < deadline:
         if shutdown_event and shutdown_event.is_set():
             return None
-        outcome = _fetch_resolved_outcome(window_ts)
+        verbose = (poll_count == 0) or (poll_count % 6 == 0)  # first + every ~60s
+        outcome = _fetch_resolved_outcome(window_ts, verbose=verbose)
         if outcome:
             return outcome
+        poll_count += 1
         if shutdown_event:
             shutdown_event.wait(RESOLUTION_POLL)
         else:
             time.sleep(RESOLUTION_POLL)
 
+    _print(f"    Resolution timeout after {RESOLUTION_TIMEOUT}s for window {window_ts}")
     return None
 
 
@@ -502,19 +506,22 @@ def _catch_up_outcomes(state: BotState) -> None:
         return
 
     _print(f"  Catching up {len(missed)} missed window(s)...")
+    caught = 0
     for ts in missed:
-        outcome = _fetch_resolved_outcome(ts)
+        outcome = _fetch_resolved_outcome(ts, verbose=(caught == 0))
         if outcome:
             state.recent_outcomes.append(outcome)
             if len(state.recent_outcomes) > 5:
                 state.recent_outcomes.pop(0)
             state.last_window_ts = ts
+            caught += 1
         else:
-            # Window not yet resolved — stop catching up here
-            break
+            # Skip unresolvable windows — still advance last_window_ts
+            # so we don't re-attempt the same stuck window forever
+            state.last_window_ts = ts
 
     if missed:
-        _print(f"  Outcomes now: {' → '.join(state.recent_outcomes[-5:])}")
+        _print(f"  Caught up {caught}/{len(missed)} outcomes: {' → '.join(state.recent_outcomes[-5:])}")
 
 
 def _run_one_cycle(
