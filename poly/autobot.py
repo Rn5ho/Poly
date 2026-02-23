@@ -170,7 +170,10 @@ def _current_window_ts() -> int:
     return (now // WINDOW_SECONDS) * WINDOW_SECONDS
 
 
-def _wait_for_resolution(window_ts: int) -> str | None:
+def _wait_for_resolution(
+    window_ts: int,
+    shutdown_event: threading.Event | None = None,
+) -> str | None:
     """Wait for a window to resolve and return the outcome."""
     window_end = window_ts + WINDOW_SECONDS
     # Wait until window ends + buffer
@@ -178,15 +181,24 @@ def _wait_for_resolution(window_ts: int) -> str | None:
     if now < window_end + RESOLUTION_WAIT:
         wait = window_end + RESOLUTION_WAIT - now
         _print(f"    Waiting {wait:.0f}s for resolution...")
-        time.sleep(wait)
+        if shutdown_event:
+            if shutdown_event.wait(wait):
+                return None
+        else:
+            time.sleep(wait)
 
     # Poll for resolution
     deadline = time.time() + RESOLUTION_TIMEOUT
     while time.time() < deadline:
+        if shutdown_event and shutdown_event.is_set():
+            return None
         outcome = _fetch_resolved_outcome(window_ts)
         if outcome:
             return outcome
-        time.sleep(RESOLUTION_POLL)
+        if shutdown_event:
+            shutdown_event.wait(RESOLUTION_POLL)
+        else:
+            time.sleep(RESOLUTION_POLL)
 
     return None
 
@@ -199,6 +211,18 @@ def _get_up_price_from_clob(token_id: str) -> float | None:
         if bids:
             # Best bid is the highest price
             return max(float(b["price"]) for b in bids)
+        return None
+    except Exception:
+        return None
+
+
+def _get_best_ask_from_clob(token_id: str) -> float | None:
+    """Get current best ask for a token from CLOB order book."""
+    try:
+        book = fetch_order_book(token_id)
+        asks = book.get("asks", [])
+        if asks:
+            return min(float(a["price"]) for a in asks)
         return None
     except Exception:
         return None
@@ -410,8 +434,8 @@ def run_bot(
         else:
             _print("  No recent outcomes (will use base rate)")
 
-    # Daily summary tracking
-    last_daily_summary = 0
+    # Daily summary tracking — init to today's midnight so we don't fire on startup
+    last_daily_summary = (int(time.time()) // 86400) * 86400
 
     # Main loop
     while not shutdown_event.is_set():
@@ -578,7 +602,7 @@ def _run_one_cycle(
     # Decide whether to trade
     if edge <= edge_threshold:
         _print(f"  No edge ({edge:+.1%} < {edge_threshold:.0%}). Skipping.")
-        _wait_and_update_outcomes(state, next_ts)
+        _wait_and_update_outcomes(state, next_ts, shutdown_event)
         return
 
     # Size the bet using live price
@@ -589,7 +613,7 @@ def _run_one_cycle(
 
     if bet_size < MIN_BET:
         _print(f"  Bet too small (${bet_size:.2f} < ${MIN_BET}). Skipping.")
-        _wait_and_update_outcomes(state, next_ts)
+        _wait_and_update_outcomes(state, next_ts, shutdown_event)
         return
 
     _print(f"  >>> BUY UP ({order_label})  |  Bet: ${bet_size:.2f}  |  Kelly: {kf:.1%}  |  Bank: ${state.bankroll:.2f}")
@@ -632,7 +656,7 @@ def _run_one_cycle(
             if not result.success:
                 _print(f"  ORDER FAILED: {result.error}")
                 notify_error(f"Order failed for {window_time}: {result.error}")
-                _wait_and_update_outcomes(state, next_ts)
+                _wait_and_update_outcomes(state, next_ts, shutdown_event)
                 return
 
             order_id = result.order_id
@@ -654,7 +678,7 @@ def _run_one_cycle(
                 if fill_status is None:
                     _print(f"    Could not verify fill status. Assuming no fill.")
                     notify_fill(order_id, 0, shares_requested, 0.0)
-                    _wait_and_update_outcomes(state, next_ts)
+                    _wait_and_update_outcomes(state, next_ts, shutdown_event)
                     return
 
                 actual_shares = fill_status.size_matched
@@ -663,7 +687,7 @@ def _run_one_cycle(
                 if actual_shares <= 0:
                     _print(f"    No fill — order {fill_status.status}. Skipping trade.")
                     notify_fill(order_id, 0, shares_requested, 0.0)
-                    _wait_and_update_outcomes(state, next_ts)
+                    _wait_and_update_outcomes(state, next_ts, shutdown_event)
                     return
 
                 actual_bet = actual_shares * buy_price
@@ -706,7 +730,7 @@ def _run_one_cycle(
         )
     else:
         # Wait for resolution
-        outcome = _wait_for_resolution(next_ts)
+        outcome = _wait_for_resolution(next_ts, shutdown_event)
         if not outcome:
             _print("  Resolution timeout! Skipping this window.")
             state.last_window_ts = next_ts
@@ -737,7 +761,7 @@ def _run_one_cycle(
         if len(state.recent_outcomes) > 5:
             state.recent_outcomes.pop(0)
     else:
-        actual_outcome = _wait_for_resolution(next_ts)
+        actual_outcome = _wait_for_resolution(next_ts, shutdown_event)
         if actual_outcome:
             state.recent_outcomes.append(actual_outcome)
             if len(state.recent_outcomes) > 5:
@@ -786,9 +810,13 @@ def _run_one_cycle(
     })
 
 
-def _wait_and_update_outcomes(state: BotState, window_ts: int) -> None:
+def _wait_and_update_outcomes(
+    state: BotState,
+    window_ts: int,
+    shutdown_event: threading.Event | None = None,
+) -> None:
     """Wait for a window to resolve and update outcome history (no trade)."""
-    outcome = _wait_for_resolution(window_ts)
+    outcome = _wait_for_resolution(window_ts, shutdown_event)
     if outcome:
         state.recent_outcomes.append(outcome)
         if len(state.recent_outcomes) > 5:
@@ -838,7 +866,7 @@ def _run_dip_cycle(
     market = _fetch_5m_market(next_ts)
     if not market or not market.up_token_id:
         _print(f"  Market not found for {window_time}. Skipping.")
-        _wait_and_update_outcomes(state, next_ts)
+        _wait_and_update_outcomes(state, next_ts, shutdown_event)
         return
 
     up_token_id = market.up_token_id
@@ -946,11 +974,11 @@ def _run_dip_cycle(
 
     if not buys:
         _print(f"  No dips below {DIP_ENTRY_PRICE:.2f} this window.")
-        _wait_and_update_outcomes(state, next_ts)
+        _wait_and_update_outcomes(state, next_ts, shutdown_event)
         return
 
     # Wait for resolution
-    outcome = _wait_for_resolution(next_ts)
+    outcome = _wait_for_resolution(next_ts, shutdown_event)
     if not outcome:
         _print("  Resolution timeout!")
         state.last_window_ts = next_ts
@@ -1061,7 +1089,7 @@ def _run_arb_cycle(
     market = _fetch_5m_market(next_ts)
     if not market or not market.up_token_id or not market.down_token_id:
         _print(f"  Market not found for {window_time}. Skipping.")
-        _wait_and_update_outcomes(state, next_ts)
+        _wait_and_update_outcomes(state, next_ts, shutdown_event)
         return
 
     up_token_id = market.up_token_id
@@ -1079,9 +1107,9 @@ def _run_arb_cycle(
         if shutdown_event and shutdown_event.is_set():
             return
 
-        # Get prices for both sides
-        up_price = _get_up_price_from_clob(up_token_id)
-        down_price = _get_up_price_from_clob(down_token_id)  # same func, gets best bid
+        # Get ask prices for both sides (we're buying taker, so we pay the ask)
+        up_price = _get_best_ask_from_clob(up_token_id)
+        down_price = _get_best_ask_from_clob(down_token_id)
 
         if up_price is None or down_price is None:
             time.sleep(STOPLOSS_POLL)
@@ -1175,11 +1203,11 @@ def _run_arb_cycle(
 
     if not arb_buys:
         _print(f"  No arb opportunity (combined never < {ARB_MAX_COMBINED:.2f})")
-        _wait_and_update_outcomes(state, next_ts)
+        _wait_and_update_outcomes(state, next_ts, shutdown_event)
         return
 
     # Wait for resolution
-    outcome = _wait_for_resolution(next_ts)
+    outcome = _wait_for_resolution(next_ts, shutdown_event)
     if not outcome:
         _print("  Resolution timeout!")
         state.last_window_ts = next_ts

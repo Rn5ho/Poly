@@ -311,46 +311,57 @@ def notify_shutdown(
 
 
 def send_daily_summary() -> None:
-    """Send a daily summary from the trade log.
+    """Send a daily summary from the trade log and state file.
 
-    Reads poly_bot_log.jsonl and summarizes the last 24 hours.
-    Call this from a cron job or at a fixed time in the bot loop.
+    Uses state file for current bankroll (avoids cross-session contamination).
+    Uses trade log for last-24h trade stats (count, WR, P&L).
     """
-    if not LOG_FILE.exists():
-        return
+    # Get current bankroll from state file (authoritative, session-aware)
+    state = _load_state()
+    current_bank = state.get("bankroll", 0)
+    all_time_trades = state.get("total_trades", 0)
 
+    # Get last-24h trades from log
     cutoff = time.time() - 86400
     trades = []
-    try:
-        for line in LOG_FILE.read_text().strip().split("\n"):
-            if not line:
-                continue
-            trade = json.loads(line)
-            if trade.get("ts", 0) >= cutoff:
-                trades.append(trade)
-    except Exception:
-        return
+    if LOG_FILE.exists():
+        try:
+            for line in LOG_FILE.read_text().strip().split("\n"):
+                if not line:
+                    continue
+                trade = json.loads(line)
+                if trade.get("ts", 0) >= cutoff:
+                    trades.append(trade)
+        except Exception:
+            pass
 
-    if not trades:
+    if not trades and not state:
         _send("📊 <b>DAILY SUMMARY</b>\nNo trades in last 24h.")
         return
 
-    wins = sum(1 for t in trades if t.get("won"))
-    losses = len(trades) - wins
-    total_pnl = sum(t.get("pnl", 0) for t in trades)
-    wr = wins / len(trades) if trades else 0
-    stopouts = sum(1 for t in trades if t.get("stopped_out"))
-    final_bank = trades[-1].get("bankroll", 0)
-    max_dd = max((t.get("drawdown", 0) for t in trades), default=0)
+    if trades:
+        wins = sum(1 for t in trades if t.get("won"))
+        losses = len(trades) - wins
+        total_pnl = sum(t.get("pnl", 0) for t in trades)
+        wr = wins / len(trades)
+        stopouts = sum(1 for t in trades if t.get("stopped_out"))
+        max_dd = max((t.get("drawdown", 0) for t in trades), default=0)
+    else:
+        wins = losses = 0
+        total_pnl = 0.0
+        wr = 0.0
+        stopouts = 0
+        max_dd = state.get("max_drawdown", 0)
 
     text = (
         f"📊 <b>DAILY SUMMARY</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n\n"
-        f"Trades: {len(trades)} ({wins}W / {losses}L)\n"
+        f"Trades (24h): {len(trades)} ({wins}W / {losses}L)\n"
         f"Win rate: {wr:.1%}\n"
-        f"P&L: <b>${total_pnl:+,.2f}</b>\n"
-        f"Bankroll: ${final_bank:,.2f}\n"
+        f"P&L (24h): <b>${total_pnl:+,.2f}</b>\n"
+        f"Bankroll: ${current_bank:,.2f}\n"
         f"Max DD: {max_dd:.1%}\n"
-        f"Stop-outs: {stopouts}"
+        f"Stop-outs: {stopouts}\n"
+        f"Total trades: {all_time_trades}"
     )
     _send(text)
 
