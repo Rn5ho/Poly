@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=poly
 WorkingDirectory=/opt/poly
-ExecStart=/opt/poly/venv/bin/python -u -m poly.autobot --maker
+ExecStart=/opt/poly/venv/bin/python -u -m poly.main autobot --maker -b 100 --fresh
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=30
